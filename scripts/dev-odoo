@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+mkdir -p data logs
+
+export AGENTIC_HEADLESS_API_KEY="${AGENTIC_HEADLESS_API_KEY:-dev-agentic-key}"
+
+exec "$ROOT/vendor/odoo/odoo-bin" \
+  --config "$ROOT/config/odoo.conf" \
+  --addons-path "$ROOT/vendor/odoo/addons,$ROOT/custom_addons" \
+  "$@"
+

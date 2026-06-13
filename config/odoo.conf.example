@@ -1,0 +1,11 @@
+[options]
+addons_path = vendor/odoo/addons,custom_addons
+data_dir = data
+http_port = 8069
+logfile = logs/odoo.log
+admin_passwd = change-me
+db_host = localhost
+db_port = 5432
+db_user = odoo
+db_password = odoo
+
