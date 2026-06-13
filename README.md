@@ -57,6 +57,7 @@ Authorization: Bearer <key>
 Endpoints:
 
 - `GET /agentic/v1/health`
+- `GET|POST /agentic/v1/business_snapshot`
 - `POST /agentic/v1/schema`
 - `POST /agentic/v1/search_read`
 - `POST /agentic/v1/create`
@@ -71,3 +72,17 @@ curl -s http://localhost:8069/agentic/v1/search_read \
   -H "content-type: application/json" \
   -d '{"model":"res.partner","domain":[],"fields":["name","email"],"limit":5}'
 ```
+
+Business comprehension snapshot:
+
+```bash
+curl -s http://localhost:8069/agentic/v1/business_snapshot \
+  -H "authorization: Bearer dev-agentic-key" \
+  -H "content-type: application/json" \
+  -d '{"sample_limit":3}'
+```
+
+## Product Backlog
+
+The working backlog lives in `BACKLOG.md`. The daily implementation ritual lives
+in `docs/DAILY_LOOP.md`.
