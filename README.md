@@ -17,12 +17,29 @@ scripts/dev-odoo             Local runner
 
 ## First Run
 
-Install Odoo's system dependencies for macOS first. PostgreSQL must be running
-and a database user must exist.
+Fast path with Docker:
 
 ```bash
 cd ~/Projects/odoo-agentic-headless
-python3 -m venv .venv
+scripts/dev-compose up
+```
+
+Then test:
+
+```bash
+curl -s http://localhost:8069/agentic/v1/health
+curl -s http://localhost:8069/agentic/v1/search_read \
+  -H "authorization: Bearer dev-agentic-key" \
+  -H "content-type: application/json" \
+  -d '{"model":"res.partner","domain":[],"fields":["name","email"],"limit":5}'
+```
+
+Source path for deeper Odoo development. Install Odoo's system dependencies for
+macOS first. PostgreSQL must be running and a database user must exist.
+
+```bash
+cd ~/Projects/odoo-agentic-headless
+$(brew --prefix python@3.12)/bin/python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -r vendor/odoo/requirements.txt
 cp config/odoo.conf.example config/odoo.conf
@@ -54,4 +71,3 @@ curl -s http://localhost:8069/agentic/v1/search_read \
   -H "content-type: application/json" \
   -d '{"model":"res.partner","domain":[],"fields":["name","email"],"limit":5}'
 ```
-

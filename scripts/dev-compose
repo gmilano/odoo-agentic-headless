@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Homebrew's Docker Compose plugin on this machine speaks an older default API.
+export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.44}"
+export AGENTIC_HEADLESS_API_KEY="${AGENTIC_HEADLESS_API_KEY:-dev-agentic-key}"
+
+exec docker compose "$@"
+
