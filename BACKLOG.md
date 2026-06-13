@@ -13,12 +13,12 @@ and which agent can safely execute it.
 - [x] `AH-0002` Add secured headless CRUD/schema/call API.
 - [x] `AH-0003` Add Docker runtime with Postgres and Odoo 19.0.
 - [x] `AH-0004` Add first business comprehension endpoint: `business_snapshot`.
+- [x] `AH-0007` Add `/agentic/v1/capabilities`: models, installed domains, allowed operations, risky operations.
 
 ## P0 — ERP Comprehension Core
 
 - [ ] `AH-0005` Add persistent `agentic.request.log` model for every API call.
 - [ ] `AH-0006` Add `business_snapshot` trend memory: compare current counts with previous snapshot.
-- [ ] `AH-0007` Add `/agentic/v1/capabilities`: models, installed domains, allowed operations, risky operations.
 - [ ] `AH-0008` Add `/agentic/v1/business_events`: normalized recent changes across CRM, Sales, Inventory, Accounting, Projects.
 - [ ] `AH-0009` Add `/agentic/v1/action_plan`: read a natural language goal, return typed executable Odoo operations without executing.
 - [ ] `AH-0010` Add `/agentic/v1/execute_plan`: execute approved action plans with audit log and rollback hints.
@@ -52,3 +52,6 @@ Every day at 08:00 America/Montevideo:
 6. Update this backlog with status, new follow-up ideas, and today's notes.
 7. Send Gastón a concise Telegram summary with what changed, tests, and next target.
 
+## Daily Notes
+
+- 2026-06-13 08:03 America/Montevideo: completed `AH-0007` with authenticated `GET|POST /agentic/v1/capabilities`. It reports addon/API version, installed modules, tracked ERP model availability/fields, allowed operations, risky operations, guardrail flags, and the next safety gaps. Follow-up: implement `AH-0005` so these calls become auditable instead of only discoverable.

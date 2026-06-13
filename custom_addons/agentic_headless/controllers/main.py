@@ -8,6 +8,72 @@ from odoo.http import Response, request
 MAX_LIMIT = 200
 SNAPSHOT_SAMPLE_LIMIT = 3
 
+ALLOWED_OPERATIONS = [
+    {
+        "name": "schema",
+        "endpoint": "/agentic/v1/schema",
+        "method": "POST",
+        "risk": "low",
+        "effect": "read_metadata",
+    },
+    {
+        "name": "search_read",
+        "endpoint": "/agentic/v1/search_read",
+        "method": "POST",
+        "risk": "low",
+        "effect": "read_records",
+    },
+    {
+        "name": "business_snapshot",
+        "endpoint": "/agentic/v1/business_snapshot",
+        "method": "GET|POST",
+        "risk": "low",
+        "effect": "read_business_summary",
+    },
+    {
+        "name": "create",
+        "endpoint": "/agentic/v1/create",
+        "method": "POST",
+        "risk": "medium",
+        "effect": "create_record",
+        "requires_approval": False,
+    },
+    {
+        "name": "write",
+        "endpoint": "/agentic/v1/write",
+        "method": "POST",
+        "risk": "medium",
+        "effect": "update_records",
+        "requires_approval": False,
+    },
+    {
+        "name": "call",
+        "endpoint": "/agentic/v1/call",
+        "method": "POST",
+        "risk": "high",
+        "effect": "invoke_model_method",
+        "requires_approval": True,
+    },
+]
+
+RISKY_OPERATIONS = [
+    {
+        "name": "call",
+        "reason": "Arbitrary public model methods can trigger workflows, posting, confirmations, or integrations.",
+        "current_guardrail": "Private methods are blocked. Approval queue is not implemented yet.",
+    },
+    {
+        "name": "write_financial_records",
+        "reason": "Financial records can affect invoices, journals, tax reports, and external accounting state.",
+        "current_guardrail": "Use schema/search_read first; explicit approval will be added in AH-0010/AH-0106.",
+    },
+    {
+        "name": "confirm_or_cancel_documents",
+        "reason": "State-changing workflow methods can commit sales, purchase, stock, manufacturing, or accounting actions.",
+        "current_guardrail": "Treat state transition methods as approval-required through the agent adapter.",
+    },
+]
+
 ERP_MODEL_CATALOG = [
     ("res.partner", "contacts", ["name", "email", "phone", "is_company"]),
     ("res.company", "companies", ["name", "email", "phone", "currency_id"]),
@@ -145,6 +211,56 @@ class AgenticHeadlessController(http.Controller):
             },
             "erp_surface": surface,
             "insights": business_insights(available, modules),
+        })
+
+    @http.route(
+        "/agentic/v1/capabilities",
+        type="http",
+        auth="public",
+        methods=["GET", "POST"],
+        csrf=False,
+        cors="*",
+    )
+    def capabilities(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        modules = installed_modules()
+        domains = [domain_capability(model, domain, fields) for model, domain, fields in ERP_MODEL_CATALOG]
+        available_domains = [domain for domain in domains if domain["available"]]
+
+        return json_response({
+            "ok": True,
+            "database": getattr(request.env.cr, "dbname", None),
+            "service": {
+                "name": "agentic_headless",
+                "version": addon_version(),
+                "api_version": "v1",
+            },
+            "installed_modules": {
+                "count": len(modules),
+                "names": modules[:120],
+            },
+            "models": {
+                "tracked_count": len(domains),
+                "available_count": len(available_domains),
+                "domains": domains,
+            },
+            "allowed_operations": ALLOWED_OPERATIONS,
+            "risky_operations": RISKY_OPERATIONS,
+            "guardrails": {
+                "authentication": "Bearer token via AGENTIC_HEADLESS_API_KEY",
+                "private_methods_blocked": True,
+                "max_search_read_limit": MAX_LIMIT,
+                "audit_log_model": False,
+                "approval_queue": False,
+            },
+            "next_safety_gaps": [
+                "Persist every API request in agentic.request.log.",
+                "Classify write/call payloads before execution.",
+                "Require explicit approval for financial and destructive workflow transitions.",
+            ],
         })
 
     @http.route(
@@ -342,9 +458,59 @@ def model_snapshot(model_name, domain_name, requested_fields, sample_limit):
     }
 
 
+def domain_capability(model_name, domain_name, requested_fields):
+    if not model_exists(model_name):
+        return {
+            "domain": domain_name,
+            "model": model_name,
+            "available": False,
+            "readable": False,
+            "writable": False,
+            "fields": [],
+        }
+
+    model = request.env[model_name].sudo().with_context(agentic_headless=True)
+    fields = model.fields_get(attributes=["type", "readonly", "required", "relation"])
+    field_names = available_fields(model, requested_fields)
+    return {
+        "domain": domain_name,
+        "model": model_name,
+        "available": True,
+        "readable": True,
+        "writable": has_writable_fields(fields),
+        "fields": [
+            {
+                "name": field_name,
+                "type": fields[field_name].get("type"),
+                "relation": fields[field_name].get("relation"),
+                "required": bool(fields[field_name].get("required")),
+                "readonly": bool(fields[field_name].get("readonly")),
+            }
+            for field_name in field_names
+        ],
+    }
+
+
 def available_fields(model, requested_fields):
     all_fields = model.fields_get(attributes=["string", "type"])
     return [field for field in requested_fields if field in all_fields]
+
+
+def has_writable_fields(fields):
+    return any(
+        not field.get("readonly")
+        for field in fields.values()
+    )
+
+
+def addon_version():
+    if not model_exists("ir.module.module"):
+        return None
+    module = request.env["ir.module.module"].sudo().search(
+        [("name", "=", "agentic_headless")],
+        limit=1,
+    )
+    return module.installed_version if module else None
 
 
 def default_order(model):
