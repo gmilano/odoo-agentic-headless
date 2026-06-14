@@ -7,6 +7,7 @@ from odoo.http import Response, request
 
 MAX_LIMIT = 200
 SNAPSHOT_SAMPLE_LIMIT = 3
+MAX_LOG_JSON_CHARS = 20000
 
 ALLOWED_OPERATIONS = [
     {
@@ -253,7 +254,7 @@ class AgenticHeadlessController(http.Controller):
                 "authentication": "Bearer token via AGENTIC_HEADLESS_API_KEY",
                 "private_methods_blocked": True,
                 "max_search_read_limit": MAX_LIMIT,
-                "audit_log_model": False,
+                "audit_log_model": model_exists("agentic.request.log"),
                 "approval_queue": False,
             },
             "next_safety_gaps": [
@@ -583,6 +584,7 @@ def jsonable(value):
 
 
 def json_response(payload, status=200):
+    log_api_response(payload, status)
     return Response(
         json.dumps(payload, default=str),
         status=status,
@@ -598,3 +600,50 @@ def json_error(code, message, status):
             "message": message,
         },
     }, status=status)
+
+
+def log_api_response(payload, status):
+    if not model_exists("agentic.request.log") or not table_exists("agentic_request_log"):
+        return
+
+    try:
+        path = request.httprequest.path
+        body = read_json()
+        error = payload.get("error") if isinstance(payload, dict) else None
+        operation = path.rsplit("/", 1)[-1] if path else None
+        expected = os.getenv("AGENTIC_HEADLESS_API_KEY", "").strip()
+        header = request.httprequest.headers.get("Authorization", "")
+        token = header.removeprefix("Bearer ").strip()
+
+        with request.env.cr.savepoint():
+            request.env["agentic.request.log"].sudo().create({
+                "name": f"{request.httprequest.method} {path}",
+                "endpoint": path,
+                "method": request.httprequest.method,
+                "operation": operation,
+                "model_name": body.get("model") if isinstance(body, dict) else None,
+                "status_code": status,
+                "ok": bool(payload.get("ok")) if isinstance(payload, dict) else status < 400,
+                "error_code": error.get("code") if isinstance(error, dict) else None,
+                "authenticated": bool(expected and token == expected),
+                "remote_addr": request.httprequest.remote_addr,
+                "user_agent": request.httprequest.user_agent.string,
+                "payload_json": truncated_json(body),
+                "response_json": truncated_json(payload),
+            })
+    except Exception:
+        # Audit logging must never break the operational API path.
+        return
+
+
+def table_exists(table_name):
+    with request.env.cr.savepoint():
+        request.env.cr.execute("SELECT to_regclass(%s)", [table_name])
+        return bool(request.env.cr.fetchone()[0])
+
+
+def truncated_json(value):
+    rendered = json.dumps(value, default=str, sort_keys=True)
+    if len(rendered) <= MAX_LOG_JSON_CHARS:
+        return rendered
+    return rendered[:MAX_LOG_JSON_CHARS] + "...[truncated]"

@@ -17,11 +17,12 @@ and which agent can safely execute it.
 
 ## P0 — ERP Comprehension Core
 
-- [ ] `AH-0005` Add persistent `agentic.request.log` model for every API call.
+- [x] `AH-0005` Add persistent `agentic.request.log` model for every API call.
 - [ ] `AH-0006` Add `business_snapshot` trend memory: compare current counts with previous snapshot.
 - [ ] `AH-0008` Add `/agentic/v1/business_events`: normalized recent changes across CRM, Sales, Inventory, Accounting, Projects.
 - [ ] `AH-0009` Add `/agentic/v1/action_plan`: read a natural language goal, return typed executable Odoo operations without executing.
 - [ ] `AH-0010` Add `/agentic/v1/execute_plan`: execute approved action plans with audit log and rollback hints.
+- [ ] `AH-0011` Add audit-log query filters and retention policy for agent reviews.
 
 ## P1 — SAP-Replacement Demo Surface
 
@@ -55,3 +56,4 @@ Every day at 08:00 America/Montevideo:
 ## Daily Notes
 
 - 2026-06-13 08:03 America/Montevideo: completed `AH-0007` with authenticated `GET|POST /agentic/v1/capabilities`. It reports addon/API version, installed modules, tracked ERP model availability/fields, allowed operations, risky operations, guardrail flags, and the next safety gaps. Follow-up: implement `AH-0005` so these calls become auditable instead of only discoverable.
+- 2026-06-14 08:05 America/Montevideo: completed `AH-0005` with persistent `agentic.request.log` audit rows for API responses, including endpoint, operation, model, status, auth result, error code, payload, and response snapshots. Verified module upgrade, capabilities smoke, and unauthorized request logging. Follow-up: use the audit trail as the substrate for `AH-0009`/`AH-0010` approval-safe plan execution.
