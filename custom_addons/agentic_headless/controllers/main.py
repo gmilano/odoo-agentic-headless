@@ -211,6 +211,7 @@ class AgenticHeadlessController(http.Controller):
                 "names": modules[:80],
             },
             "erp_surface": surface,
+            "trend_memory": business_snapshot_trend(surface),
             "insights": business_insights(available, modules),
         })
 
@@ -258,7 +259,7 @@ class AgenticHeadlessController(http.Controller):
                 "approval_queue": False,
             },
             "next_safety_gaps": [
-                "Persist every API request in agentic.request.log.",
+                "Add query filters and retention controls for agentic.request.log.",
                 "Classify write/call payloads before execution.",
                 "Require explicit approval for financial and destructive workflow transitions.",
             ],
@@ -561,6 +562,97 @@ def business_insights(available, modules):
         })
 
     return insights
+
+
+def business_snapshot_trend(surface):
+    previous = previous_business_snapshot()
+    if not previous:
+        return {
+            "available": False,
+            "baseline": True,
+            "summary": "No previous successful business snapshot was found. This response becomes the trend baseline.",
+            "changes": [],
+        }
+
+    previous_surface = previous.get("payload", {}).get("erp_surface") or []
+    previous_by_model = {
+        item.get("model"): item
+        for item in previous_surface
+        if isinstance(item, dict) and item.get("model")
+    }
+    changes = []
+    net_count_delta = 0
+
+    for item in surface:
+        prior = previous_by_model.get(item["model"], {})
+        previous_count = int(prior.get("count") or 0)
+        current_count = int(item.get("count") or 0)
+        delta = current_count - previous_count
+        net_count_delta += delta
+        availability_changed = bool(prior.get("available")) != bool(item.get("available"))
+        if delta or availability_changed:
+            changes.append({
+                "domain": item["domain"],
+                "model": item["model"],
+                "previous_count": previous_count,
+                "current_count": current_count,
+                "delta": delta,
+                "availability_changed": availability_changed,
+            })
+
+    return {
+        "available": True,
+        "baseline": False,
+        "compared_to": {
+            "request_log_id": previous["id"],
+            "captured_at": previous["create_date"],
+        },
+        "changed_domains": len(changes),
+        "net_count_delta": net_count_delta,
+        "changes": changes,
+        "summary": trend_summary(changes, net_count_delta),
+    }
+
+
+def previous_business_snapshot():
+    if not model_exists("agentic.request.log") or not table_exists("agentic_request_log"):
+        return None
+
+    logs = request.env["agentic.request.log"].sudo().search(
+        [
+            ("endpoint", "=", "/agentic/v1/business_snapshot"),
+            ("ok", "=", True),
+            ("status_code", ">=", 200),
+            ("status_code", "<", 300),
+        ],
+        order="create_date desc, id desc",
+        limit=20,
+    )
+    for log in logs:
+        try:
+            payload = json.loads(log.response_json or "{}")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("erp_surface"), list):
+            return {
+                "id": log.id,
+                "create_date": log.create_date,
+                "payload": payload,
+            }
+    return None
+
+
+def trend_summary(changes, net_count_delta):
+    if not changes:
+        return "No tracked ERP domain counts changed since the previous successful business snapshot."
+
+    direction = "increased" if net_count_delta > 0 else "decreased" if net_count_delta < 0 else "changed"
+    top_changes = sorted(changes, key=lambda item: abs(item["delta"]), reverse=True)[:3]
+    domains = ", ".join(
+        f"{item['domain']} ({item['delta']:+d})"
+        for item in top_changes
+    )
+    return f"Tracked ERP records {direction} by {net_count_delta:+d} overall. Largest domain changes: {domains}."
 
 
 def bounded_limit(value):
