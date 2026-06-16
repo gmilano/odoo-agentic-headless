@@ -1,6 +1,8 @@
 import json
 import os
+from datetime import timedelta
 
+from odoo import fields as odoo_fields
 from odoo import http
 from odoo.http import Response, request
 
@@ -30,6 +32,13 @@ ALLOWED_OPERATIONS = [
         "method": "GET|POST",
         "risk": "low",
         "effect": "read_business_summary",
+    },
+    {
+        "name": "business_events",
+        "endpoint": "/agentic/v1/business_events",
+        "method": "GET|POST",
+        "risk": "low",
+        "effect": "read_normalized_recent_changes",
     },
     {
         "name": "create",
@@ -89,6 +98,15 @@ ERP_MODEL_CATALOG = [
     ("hr.employee", "people", ["name", "work_email", "department_id", "job_id"]),
     ("mrp.production", "manufacturing", ["name", "product_id", "state", "product_qty"]),
     ("helpdesk.ticket", "support", ["name", "partner_id", "stage_id", "priority"]),
+]
+
+BUSINESS_EVENT_MODEL_CATALOG = [
+    ("crm.lead", "crm", ["name", "stage_id", "expected_revenue", "probability", "create_date", "write_date", "create_uid", "write_uid"]),
+    ("sale.order", "sales", ["name", "partner_id", "state", "amount_total", "date_order", "create_date", "write_date", "create_uid", "write_uid"]),
+    ("stock.picking", "inventory", ["name", "partner_id", "state", "scheduled_date", "create_date", "write_date", "create_uid", "write_uid"]),
+    ("account.move", "accounting", ["name", "partner_id", "state", "move_type", "amount_total", "create_date", "write_date", "create_uid", "write_uid"]),
+    ("project.project", "projects", ["name", "partner_id", "user_id", "create_date", "write_date", "create_uid", "write_uid"]),
+    ("project.task", "projects", ["name", "project_id", "stage_id", "user_ids", "create_date", "write_date", "create_uid", "write_uid"]),
 ]
 
 
@@ -213,6 +231,60 @@ class AgenticHeadlessController(http.Controller):
             "erp_surface": surface,
             "trend_memory": business_snapshot_trend(surface),
             "insights": business_insights(available, modules),
+        })
+
+    @http.route(
+        "/agentic/v1/business_events",
+        type="http",
+        auth="public",
+        methods=["GET", "POST"],
+        csrf=False,
+        cors="*",
+    )
+    def business_events(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        payload = read_json()
+        limit = min(bounded_limit(payload.get("limit", 50)), 100)
+        since_days = bounded_days(payload.get("since_days", 7))
+        since = odoo_fields.Datetime.now() - timedelta(days=since_days)
+
+        model_results = [
+            normalized_model_events(model, domain, requested_fields, since, limit)
+            for model, domain, requested_fields in BUSINESS_EVENT_MODEL_CATALOG
+        ]
+        events = sorted(
+            [
+                event
+                for result in model_results
+                for event in result["events"]
+            ],
+            key=lambda event: event["occurred_at"] or "",
+            reverse=True,
+        )[:limit]
+
+        return json_response({
+            "ok": True,
+            "database": getattr(request.env.cr, "dbname", None),
+            "window": {
+                "since_days": since_days,
+                "since": odoo_fields.Datetime.to_string(since),
+                "limit": limit,
+            },
+            "coverage": [
+                {
+                    "domain": result["domain"],
+                    "model": result["model"],
+                    "available": result["available"],
+                    "count": result["count"],
+                }
+                for result in model_results
+            ],
+            "count": len(events),
+            "events": events,
+            "insights": business_event_insights(events, model_results),
         })
 
     @http.route(
@@ -460,6 +532,163 @@ def model_snapshot(model_name, domain_name, requested_fields, sample_limit):
     }
 
 
+def normalized_model_events(model_name, domain_name, requested_fields, since, limit):
+    if not model_exists(model_name):
+        return {
+            "model": model_name,
+            "domain": domain_name,
+            "available": False,
+            "count": 0,
+            "events": [],
+        }
+
+    model = request.env[model_name].sudo().with_context(agentic_headless=True)
+    all_fields = model.fields_get(attributes=["type"])
+    date_domain = recent_activity_domain(all_fields, since)
+    if not date_domain:
+        return {
+            "model": model_name,
+            "domain": domain_name,
+            "available": True,
+            "count": 0,
+            "events": [],
+        }
+
+    fields = available_fields(model, requested_fields)
+    if "display_name" not in fields:
+        fields.append("display_name")
+    rows = model.search_read(
+        domain=date_domain,
+        fields=fields,
+        limit=limit,
+        order=default_order(model),
+    )
+    return {
+        "model": model_name,
+        "domain": domain_name,
+        "available": True,
+        "count": len(rows),
+        "events": [
+            normalize_business_event(model_name, domain_name, row)
+            for row in rows
+        ],
+    }
+
+
+def recent_activity_domain(all_fields, since):
+    since_value = odoo_fields.Datetime.to_string(since)
+    has_create = "create_date" in all_fields
+    has_write = "write_date" in all_fields
+    if has_create and has_write:
+        return ["|", ("create_date", ">=", since_value), ("write_date", ">=", since_value)]
+    if has_write:
+        return [("write_date", ">=", since_value)]
+    if has_create:
+        return [("create_date", ">=", since_value)]
+    return []
+
+
+def normalize_business_event(model_name, domain_name, row):
+    create_date = row.get("create_date")
+    write_date = row.get("write_date")
+    occurred_at = write_date or create_date
+    event_type = "created"
+    actor = row.get("create_uid")
+    if write_date and write_date != create_date:
+        event_type = "updated"
+        actor = row.get("write_uid") or actor
+
+    return {
+        "id": f"{model_name}:{row.get('id')}:{event_type}:{occurred_at}",
+        "domain": domain_name,
+        "model": model_name,
+        "record_id": row.get("id"),
+        "record_name": row.get("display_name") or row.get("name"),
+        "event_type": event_type,
+        "occurred_at": occurred_at,
+        "actor": relational_value(actor),
+        "summary": business_event_summary(domain_name, row, event_type),
+        "signals": business_event_signals(row),
+    }
+
+
+def business_event_summary(domain_name, row, event_type):
+    name = row.get("display_name") or row.get("name") or f"record {row.get('id')}"
+    state = plain_relational_value(row.get("state") or row.get("stage_id"))
+    amount = row.get("amount_total") or row.get("expected_revenue")
+    pieces = [f"{domain_name} {event_type}: {name}"]
+    if state:
+        pieces.append(f"state/stage={state}")
+    if amount:
+        pieces.append(f"amount={amount}")
+    return "; ".join(pieces)
+
+
+def business_event_signals(row):
+    keys = [
+        "partner_id",
+        "state",
+        "stage_id",
+        "amount_total",
+        "expected_revenue",
+        "probability",
+        "move_type",
+        "scheduled_date",
+        "date_order",
+        "project_id",
+        "user_id",
+        "user_ids",
+    ]
+    return {
+        key: jsonable(row.get(key))
+        for key in keys
+        if key in row and row.get(key) not in (None, False, [], "")
+    }
+
+
+def relational_value(value):
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return {
+            "id": value[0],
+            "name": value[1],
+        }
+    return value
+
+
+def plain_relational_value(value):
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return value[1]
+    return value
+
+
+def business_event_insights(events, model_results):
+    available = [result for result in model_results if result["available"]]
+    inactive = [result["domain"] for result in available if not result["count"]]
+    if not events:
+        return [{
+            "level": "quiet",
+            "title": "No recent operational events",
+            "detail": "No tracked CRM, Sales, Inventory, Accounting, or Project records changed in the selected window.",
+        }]
+
+    domains = {}
+    for event in events:
+        domains[event["domain"]] = domains.get(event["domain"], 0) + 1
+
+    insights = [{
+        "level": "activity",
+        "title": "Recent business activity is available for agent review",
+        "detail": ", ".join(f"{domain}: {count}" for domain, count in sorted(domains.items())),
+    }]
+    if inactive:
+        insights.append({
+            "level": "coverage",
+            "title": "Some installed operational domains are quiet",
+            "detail": f"No recent tracked changes for: {', '.join(sorted(set(inactive)))}.",
+        })
+    return insights
+
+
 def domain_capability(model_name, domain_name, requested_fields):
     if not model_exists(model_name):
         return {
@@ -661,6 +890,14 @@ def bounded_limit(value):
     except (TypeError, ValueError):
         limit = 80
     return max(1, min(limit, MAX_LIMIT))
+
+
+def bounded_days(value):
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        days = 7
+    return max(1, min(days, 90))
 
 
 def jsonable(value):
