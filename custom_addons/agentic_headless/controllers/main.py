@@ -49,6 +49,14 @@ ALLOWED_OPERATIONS = [
         "executes": False,
     },
     {
+        "name": "okf_bundle",
+        "endpoint": "/agentic/v1/okf_bundle",
+        "method": "GET|POST",
+        "risk": "low",
+        "effect": "export_agent_readable_okf_markdown_bundle",
+        "executes": False,
+    },
+    {
         "name": "create",
         "endpoint": "/agentic/v1/create",
         "method": "POST",
@@ -553,6 +561,35 @@ class AgenticHeadlessController(http.Controller):
         })
 
     @http.route(
+        "/agentic/v1/okf_bundle",
+        type="http",
+        auth="public",
+        methods=["GET", "POST"],
+        csrf=False,
+        cors="*",
+    )
+    def okf_bundle(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        payload = read_json()
+        sample_limit = min(bounded_limit(payload.get("sample_limit", SNAPSHOT_SAMPLE_LIMIT)), 10)
+        bundle = build_okf_bundle(sample_limit)
+        return json_response({
+            "ok": True,
+            "okf_version": "0.1",
+            "bundle_name": bundle["bundle_name"],
+            "generated_at": bundle["generated_at"],
+            "file_count": len(bundle["files"]),
+            "files": bundle["files"],
+            "usage": {
+                "format": "Each file entry contains an OKF markdown document. Write the paths and contents to a directory to materialize the bundle.",
+                "spec": "https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md",
+            },
+        })
+
+    @http.route(
         "/agentic/v1/create",
         type="http",
         auth="public",
@@ -788,6 +825,274 @@ def normalized_model_events(model_name, domain_name, requested_fields, since, li
             for row in rows
         ],
     }
+
+
+def build_okf_bundle(sample_limit):
+    generated_at = odoo_fields.Datetime.now().replace(microsecond=0).isoformat() + "Z"
+    modules = installed_modules()
+    surface = [model_snapshot(model, domain, fields, sample_limit) for model, domain, fields in ERP_MODEL_CATALOG]
+    domains = [domain_capability(model, domain, fields) for model, domain, fields in ERP_MODEL_CATALOG]
+    company = company_snapshot()
+    files = [
+        okf_file(
+            "index.md",
+            okf_root_index(generated_at, company, surface),
+        ),
+        okf_file(
+            "log.md",
+            okf_log(generated_at),
+        ),
+        okf_file(
+            "business/company.md",
+            okf_concept(
+                {
+                    "type": "Odoo Company",
+                    "title": company.get("name") if company else "Odoo Company",
+                    "description": "Current company context exposed by the agentic Odoo layer.",
+                    "tags": ["odoo", "company", "business-context"],
+                    "timestamp": generated_at,
+                },
+                okf_company_body(company),
+            ),
+        ),
+        okf_file(
+            "business/capabilities.md",
+            okf_concept(
+                {
+                    "type": "Agentic API Capability Map",
+                    "title": "Agentic Headless Capabilities",
+                    "description": "Installed modules, tracked domains, operations, and guardrails available to agents.",
+                    "resource": "/agentic/v1/capabilities",
+                    "tags": ["odoo", "agentic-api", "capabilities"],
+                    "timestamp": generated_at,
+                },
+                okf_capabilities_body(modules, domains),
+            ),
+        ),
+    ]
+
+    files.extend(okf_domain_file(item, generated_at) for item in surface)
+    files.extend(okf_operation_file(operation, generated_at) for operation in ALLOWED_OPERATIONS)
+    return {
+        "bundle_name": "odoo-agentic-headless",
+        "generated_at": generated_at,
+        "files": files,
+    }
+
+
+def okf_file(path, content):
+    return {
+        "path": path,
+        "content_type": "text/markdown; charset=utf-8",
+        "content": content,
+    }
+
+
+def okf_root_index(generated_at, company, surface):
+    company_name = company.get("name") if company else "Unknown company"
+    available = [item for item in surface if item["available"]]
+    return "\n".join([
+        "---",
+        'okf_version: "0.1"',
+        "---",
+        "# Odoo Agentic Headless Knowledge Bundle",
+        "",
+        f"Generated at `{generated_at}` from the Odoo database for **{company_name}**.",
+        "",
+        "# Business",
+        "",
+        "* [Company](business/company.md) - Current Odoo company context.",
+        "* [Capabilities](business/capabilities.md) - Agent-facing API operations, models, and guardrails.",
+        "",
+        "# Domains",
+        "",
+        *[
+            f"* [{item['domain']}](domains/{item['domain']}.md) - `{item['model']}` with {item.get('count', 0)} records."
+            for item in available
+        ],
+        "",
+        "# Operations",
+        "",
+        *[
+            f"* [{operation['name']}](operations/{operation['name']}.md) - {operation['effect']}."
+            for operation in ALLOWED_OPERATIONS
+        ],
+        "",
+    ])
+
+
+def okf_log(generated_at):
+    day = generated_at.split("T")[0]
+    return "\n".join([
+        "# Bundle Update Log",
+        "",
+        f"## {day}",
+        "",
+        "* **Creation**: Generated OKF v0.1 bundle from `/agentic/v1/okf_bundle`.",
+        "",
+    ])
+
+
+def okf_concept(frontmatter, body):
+    return "\n".join([
+        "---",
+        *[yaml_line(key, value) for key, value in frontmatter.items() if value not in (None, "", [])],
+        "---",
+        "",
+        body.strip(),
+        "",
+    ])
+
+
+def yaml_line(key, value):
+    if isinstance(value, list):
+        rendered = ", ".join(yaml_scalar(item) for item in value)
+        return f"{key}: [{rendered}]"
+    return f"{key}: {yaml_scalar(value)}"
+
+
+def yaml_scalar(value):
+    return json.dumps(str(value))
+
+
+def okf_company_body(company):
+    if not company:
+        return "# Summary\n\nNo active company context was available."
+    return "\n".join([
+        "# Summary",
+        "",
+        f"* Company ID: `{company.get('id')}`",
+        f"* Name: {company.get('name')}",
+        f"* Currency: {company.get('currency') or 'Unknown'}",
+        f"* Country: {company.get('country') or 'Unknown'}",
+        "",
+        "# Related Concepts",
+        "",
+        "* [Capabilities](/business/capabilities.md)",
+    ])
+
+
+def okf_capabilities_body(modules, domains):
+    available = [domain for domain in domains if domain["available"]]
+    unavailable = [domain for domain in domains if not domain["available"]]
+    return "\n".join([
+        "# Installed Modules",
+        "",
+        f"{len(modules)} modules installed.",
+        "",
+        ", ".join(f"`{module}`" for module in modules[:120]) or "No installed modules detected.",
+        "",
+        "# Available Domains",
+        "",
+        *[
+            f"* [{domain['domain']}](/domains/{domain['domain']}.md) - `{domain['model']}`"
+            for domain in available
+        ],
+        "",
+        "# Unavailable Tracked Domains",
+        "",
+        *[
+            f"* `{domain['model']}` ({domain['domain']})"
+            for domain in unavailable
+        ],
+        "",
+        "# Guardrails",
+        "",
+        "* API calls require a bearer token via `AGENTIC_HEADLESS_API_KEY`.",
+        "* Private model methods are blocked.",
+        f"* Search/read limits are capped at `{MAX_LIMIT}` records.",
+        "* Financial and workflow-changing operations should require explicit approval before execution.",
+    ])
+
+
+def okf_domain_file(item, generated_at):
+    return okf_file(
+        f"domains/{item['domain']}.md",
+        okf_concept(
+            {
+                "type": "Odoo Model Domain",
+                "title": item["domain"],
+                "description": f"Odoo model `{item['model']}` exposed as the {item['domain']} business domain.",
+                "resource": f"odoo://model/{item['model']}",
+                "tags": ["odoo", "erp-domain", item["domain"]],
+                "timestamp": generated_at,
+            },
+            okf_domain_body(item),
+        ),
+    )
+
+
+def okf_domain_body(item):
+    lines = [
+        "# Summary",
+        "",
+        f"* Model: `{item['model']}`",
+        f"* Available: `{str(item['available']).lower()}`",
+        f"* Record count: `{item.get('count', 0)}`",
+        "",
+    ]
+    if item.get("fields"):
+        lines.extend([
+            "# Schema",
+            "",
+            "| Field |",
+            "|-------|",
+            *[f"| `{field}` |" for field in item["fields"]],
+            "",
+        ])
+    if item.get("sample"):
+        lines.extend([
+            "# Examples",
+            "",
+            "```json",
+            json.dumps(item["sample"], indent=2, default=str),
+            "```",
+            "",
+        ])
+    lines.extend([
+        "# Related Concepts",
+        "",
+        "* [Capabilities](/business/capabilities.md)",
+    ])
+    return "\n".join(lines)
+
+
+def okf_operation_file(operation, generated_at):
+    return okf_file(
+        f"operations/{operation['name']}.md",
+        okf_concept(
+            {
+                "type": "Agentic API Endpoint",
+                "title": operation["name"],
+                "description": operation["effect"],
+                "resource": operation["endpoint"],
+                "tags": ["odoo", "agentic-api", operation["risk"]],
+                "timestamp": generated_at,
+            },
+            okf_operation_body(operation),
+        ),
+    )
+
+
+def okf_operation_body(operation):
+    lines = [
+        "# Summary",
+        "",
+        f"* Endpoint: `{operation['endpoint']}`",
+        f"* Method: `{operation['method']}`",
+        f"* Risk: `{operation['risk']}`",
+        f"* Effect: `{operation['effect']}`",
+        f"* Executes changes: `{str(operation.get('executes', operation['risk'] != 'low')).lower()}`",
+    ]
+    if "requires_approval" in operation:
+        lines.append(f"* Requires approval: `{str(operation['requires_approval']).lower()}`")
+    lines.extend([
+        "",
+        "# Related Concepts",
+        "",
+        "* [Capabilities](/business/capabilities.md)",
+    ])
+    return "\n".join(lines)
 
 
 def recent_activity_domain(all_fields, since):

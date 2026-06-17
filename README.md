@@ -60,6 +60,7 @@ Endpoints:
 - `GET|POST /agentic/v1/business_snapshot`
 - `GET|POST /agentic/v1/business_events`
 - `POST /agentic/v1/action_plan`
+- `GET|POST /agentic/v1/okf_bundle`
 - `POST /agentic/v1/schema`
 - `POST /agentic/v1/search_read`
 - `POST /agentic/v1/create`
@@ -101,6 +102,20 @@ curl -s http://localhost:8069/agentic/v1/action_plan \
   -H "content-type: application/json" \
   -d '{"goal":"Create a CRM lead for Acme with expected revenue 5000"}'
 ```
+
+OKF knowledge bundle export:
+
+```bash
+curl -s http://localhost:8069/agentic/v1/okf_bundle \
+  -H "authorization: Bearer dev-agentic-key" \
+  -H "content-type: application/json" \
+  -d '{"sample_limit":3}'
+```
+
+The response contains an Open Knowledge Format v0.1 bundle as Markdown file
+entries. Agents can materialize the returned `files[].path` and
+`files[].content` values into a directory, index them, or publish them as an
+agent-readable business wiki.
 
 ## Product Backlog
 
