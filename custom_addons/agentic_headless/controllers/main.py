@@ -41,6 +41,14 @@ ALLOWED_OPERATIONS = [
         "effect": "read_normalized_recent_changes",
     },
     {
+        "name": "action_plan",
+        "endpoint": "/agentic/v1/action_plan",
+        "method": "POST",
+        "risk": "low",
+        "effect": "plan_operations_without_execution",
+        "executes": False,
+    },
+    {
         "name": "create",
         "endpoint": "/agentic/v1/create",
         "method": "POST",
@@ -107,6 +115,159 @@ BUSINESS_EVENT_MODEL_CATALOG = [
     ("account.move", "accounting", ["name", "partner_id", "state", "move_type", "amount_total", "create_date", "write_date", "create_uid", "write_uid"]),
     ("project.project", "projects", ["name", "partner_id", "user_id", "create_date", "write_date", "create_uid", "write_uid"]),
     ("project.task", "projects", ["name", "project_id", "stage_id", "user_ids", "create_date", "write_date", "create_uid", "write_uid"]),
+]
+
+ACTION_PLAN_TEMPLATES = [
+    {
+        "intent": "create_crm_lead",
+        "title": "Create a CRM opportunity",
+        "keywords": ["lead", "opportunity", "crm", "pipeline", "prospect"],
+        "required_models": ["crm.lead", "res.partner"],
+        "required_inputs": ["lead name or opportunity summary"],
+        "optional_inputs": ["customer", "expected revenue", "probability", "salesperson"],
+        "operations": [
+            {
+                "operation": "search_read",
+                "endpoint": "/agentic/v1/search_read",
+                "model": "res.partner",
+                "purpose": "Find an existing customer/contact before linking the lead.",
+                "payload_template": {
+                    "model": "res.partner",
+                    "domain": [["name", "ilike", "<customer name>"]],
+                    "fields": ["name", "email", "phone", "is_company"],
+                    "limit": 5,
+                },
+            },
+            {
+                "operation": "create",
+                "endpoint": "/agentic/v1/create",
+                "model": "crm.lead",
+                "purpose": "Create the opportunity after a human or agent fills confirmed values.",
+                "payload_template": {
+                    "model": "crm.lead",
+                    "values": {
+                        "name": "<opportunity summary>",
+                        "partner_id": "<res.partner id, optional>",
+                        "expected_revenue": "<amount, optional>",
+                        "probability": "<0-100, optional>",
+                    },
+                },
+            },
+        ],
+    },
+    {
+        "intent": "create_sales_quotation",
+        "title": "Create a sales quotation",
+        "keywords": ["quote", "quotation", "sales order", "sale order", "proposal", "sell"],
+        "required_models": ["sale.order", "res.partner"],
+        "required_inputs": ["customer", "order lines or commercial summary"],
+        "optional_inputs": ["validity date", "pricelist", "salesperson"],
+        "operations": [
+            {
+                "operation": "search_read",
+                "endpoint": "/agentic/v1/search_read",
+                "model": "res.partner",
+                "purpose": "Resolve the customer before creating a quotation.",
+                "payload_template": {
+                    "model": "res.partner",
+                    "domain": [["name", "ilike", "<customer name>"]],
+                    "fields": ["name", "email", "phone", "is_company"],
+                    "limit": 5,
+                },
+            },
+            {
+                "operation": "create",
+                "endpoint": "/agentic/v1/create",
+                "model": "sale.order",
+                "purpose": "Create a draft quotation. Order lines should be added only after product and pricing lookup.",
+                "payload_template": {
+                    "model": "sale.order",
+                    "values": {
+                        "partner_id": "<res.partner id>",
+                    },
+                },
+            },
+        ],
+    },
+    {
+        "intent": "review_financial_documents",
+        "title": "Review invoices or accounting moves",
+        "keywords": ["invoice", "bill", "accounting", "payment", "overdue", "cash", "receivable", "payable"],
+        "required_models": ["account.move"],
+        "required_inputs": [],
+        "optional_inputs": ["customer/vendor", "date range", "state", "move type"],
+        "operations": [
+            {
+                "operation": "search_read",
+                "endpoint": "/agentic/v1/search_read",
+                "model": "account.move",
+                "purpose": "Inspect financial documents before proposing any state-changing action.",
+                "payload_template": {
+                    "model": "account.move",
+                    "domain": [["move_type", "in", ["out_invoice", "in_invoice"]]],
+                    "fields": ["name", "partner_id", "state", "move_type", "amount_total"],
+                    "limit": 20,
+                    "order": "date desc",
+                },
+            },
+        ],
+        "risk": "high",
+        "approval_required": True,
+    },
+    {
+        "intent": "review_inventory_deliveries",
+        "title": "Review delivery or inventory work",
+        "keywords": ["inventory", "stock", "delivery", "picking", "warehouse", "shipment", "ship"],
+        "required_models": ["stock.picking"],
+        "required_inputs": [],
+        "optional_inputs": ["customer/vendor", "scheduled date", "state"],
+        "operations": [
+            {
+                "operation": "search_read",
+                "endpoint": "/agentic/v1/search_read",
+                "model": "stock.picking",
+                "purpose": "Inspect transfers before proposing confirmations, cancellations, or scheduling changes.",
+                "payload_template": {
+                    "model": "stock.picking",
+                    "domain": [],
+                    "fields": ["name", "partner_id", "state", "scheduled_date"],
+                    "limit": 20,
+                    "order": "scheduled_date asc",
+                },
+            },
+        ],
+        "risk": "medium",
+        "approval_required": True,
+    },
+    {
+        "intent": "review_business_activity",
+        "title": "Understand recent business activity",
+        "keywords": ["what changed", "recent", "activity", "summary", "status", "snapshot", "business"],
+        "required_models": [],
+        "required_inputs": [],
+        "optional_inputs": ["time window"],
+        "operations": [
+            {
+                "operation": "business_snapshot",
+                "endpoint": "/agentic/v1/business_snapshot",
+                "model": None,
+                "purpose": "Read current ERP surface, counts, samples, and trend memory.",
+                "payload_template": {
+                    "sample_limit": 3,
+                },
+            },
+            {
+                "operation": "business_events",
+                "endpoint": "/agentic/v1/business_events",
+                "model": None,
+                "purpose": "Read normalized recent operational changes.",
+                "payload_template": {
+                    "since_days": 7,
+                    "limit": 50,
+                },
+            },
+        ],
+    },
 ]
 
 
@@ -334,6 +495,60 @@ class AgenticHeadlessController(http.Controller):
                 "Add query filters and retention controls for agentic.request.log.",
                 "Classify write/call payloads before execution.",
                 "Require explicit approval for financial and destructive workflow transitions.",
+            ],
+        })
+
+    @http.route(
+        "/agentic/v1/action_plan",
+        type="http",
+        auth="public",
+        methods=["POST"],
+        csrf=False,
+        cors="*",
+    )
+    def action_plan(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        payload = read_json()
+        goal = required_string(payload, "goal")
+        if not goal:
+            return json_error("missing_goal", "Expected JSON field 'goal'.", 400)
+
+        template = select_action_plan_template(goal)
+        unavailable_models = unavailable_required_models(template)
+        risk = template.get("risk") or inferred_plan_risk(template)
+        approval_required = bool(template.get("approval_required") or risk in {"medium", "high"})
+        missing_inputs = list(template.get("required_inputs") or [])
+        candidate_values = payload.get("candidate_values") if isinstance(payload.get("candidate_values"), dict) else {}
+
+        return json_response({
+            "ok": True,
+            "goal": goal,
+            "executes": False,
+            "plan": {
+                "intent": template["intent"],
+                "title": template["title"],
+                "risk": risk,
+                "approval_required": approval_required,
+                "status": "blocked" if unavailable_models else "draft",
+                "confidence": action_plan_confidence(goal, template),
+                "required_inputs": missing_inputs,
+                "optional_inputs": template.get("optional_inputs") or [],
+                "candidate_values": candidate_values,
+                "unavailable_models": unavailable_models,
+                "operations": template["operations"],
+                "execution_contract": {
+                    "execute_endpoint": "/agentic/v1/execute_plan",
+                    "available": False,
+                    "current_next_step": "Review and fill payload_template values, then execute manually through existing endpoints until AH-0010 exists.",
+                },
+            },
+            "guardrails": [
+                "This endpoint never creates, writes, confirms, posts, cancels, or calls model methods.",
+                "Financial, inventory workflow, and arbitrary method actions remain approval-required.",
+                "Use search_read/schema/capabilities to resolve IDs and validate fields before execution.",
             ],
         })
 
@@ -720,6 +935,78 @@ def domain_capability(model_name, domain_name, requested_fields):
             for field_name in field_names
         ],
     }
+
+
+def select_action_plan_template(goal):
+    normalized_goal = normalize_text(goal)
+    scored = [
+        (keyword_score(normalized_goal, template.get("keywords") or []), template)
+        for template in ACTION_PLAN_TEMPLATES
+    ]
+    score, template = max(scored, key=lambda item: item[0])
+    if score:
+        return template
+    return {
+        "intent": "generic_review_then_plan",
+        "title": "Inspect ERP context before proposing execution",
+        "keywords": [],
+        "required_models": [],
+        "required_inputs": ["specific target record or business object", "desired outcome"],
+        "optional_inputs": ["domain", "date range", "constraints"],
+        "operations": [
+            {
+                "operation": "capabilities",
+                "endpoint": "/agentic/v1/capabilities",
+                "model": None,
+                "purpose": "Discover installed domains, writable models, allowed operations, and safety gaps.",
+                "payload_template": {},
+            },
+            {
+                "operation": "business_snapshot",
+                "endpoint": "/agentic/v1/business_snapshot",
+                "model": None,
+                "purpose": "Understand the business surface before choosing model-specific operations.",
+                "payload_template": {
+                    "sample_limit": 3,
+                },
+            },
+        ],
+    }
+
+
+def normalize_text(value):
+    return " ".join(str(value or "").lower().split())
+
+
+def keyword_score(normalized_goal, keywords):
+    return sum(1 for keyword in keywords if keyword in normalized_goal)
+
+
+def unavailable_required_models(template):
+    return [
+        model_name
+        for model_name in template.get("required_models") or []
+        if not model_exists(model_name)
+    ]
+
+
+def inferred_plan_risk(template):
+    operation_names = {operation["operation"] for operation in template.get("operations") or []}
+    models = {operation.get("model") for operation in template.get("operations") or []}
+    if "call" in operation_names or "account.move" in models:
+        return "high"
+    if {"create", "write"} & operation_names or "stock.picking" in models:
+        return "medium"
+    return "low"
+
+
+def action_plan_confidence(goal, template):
+    if template["intent"] == "generic_review_then_plan":
+        return "low"
+    score = keyword_score(normalize_text(goal), template.get("keywords") or [])
+    if score >= 2:
+        return "high"
+    return "medium"
 
 
 def available_fields(model, requested_fields):

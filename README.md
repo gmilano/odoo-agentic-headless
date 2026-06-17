@@ -59,6 +59,7 @@ Endpoints:
 - `GET /agentic/v1/health`
 - `GET|POST /agentic/v1/business_snapshot`
 - `GET|POST /agentic/v1/business_events`
+- `POST /agentic/v1/action_plan`
 - `POST /agentic/v1/schema`
 - `POST /agentic/v1/search_read`
 - `POST /agentic/v1/create`
@@ -90,6 +91,15 @@ curl -s http://localhost:8069/agentic/v1/business_events \
   -H "authorization: Bearer dev-agentic-key" \
   -H "content-type: application/json" \
   -d '{"limit":10,"since_days":7}'
+```
+
+Safe action planning without execution:
+
+```bash
+curl -s http://localhost:8069/agentic/v1/action_plan \
+  -H "authorization: Bearer dev-agentic-key" \
+  -H "content-type: application/json" \
+  -d '{"goal":"Create a CRM lead for Acme with expected revenue 5000"}'
 ```
 
 ## Product Backlog

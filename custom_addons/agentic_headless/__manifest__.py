@@ -1,7 +1,7 @@
 {
     "name": "Agentic Headless API",
     "summary": "JSON API for agentic, headless Odoo operations",
-    "version": "19.0.1.3.0",
+    "version": "19.0.1.4.0",
     "category": "Technical",
     "license": "LGPL-3",
     "author": "Wany",
