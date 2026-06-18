@@ -10,6 +10,8 @@ from odoo.http import Response, request
 MAX_LIMIT = 200
 SNAPSHOT_SAMPLE_LIMIT = 3
 MAX_LOG_JSON_CHARS = 20000
+MAX_AUDIT_LOG_LIMIT = 200
+AUDIT_LOG_RETENTION_DAYS = 90
 
 ALLOWED_OPERATIONS = [
     {
@@ -54,6 +56,14 @@ ALLOWED_OPERATIONS = [
         "method": "GET|POST",
         "risk": "low",
         "effect": "export_agent_readable_okf_markdown_bundle",
+        "executes": False,
+    },
+    {
+        "name": "audit_logs",
+        "endpoint": "/agentic/v1/audit_logs",
+        "method": "GET|POST",
+        "risk": "low",
+        "effect": "review_filtered_agentic_api_audit_trail",
         "executes": False,
     },
     {
@@ -497,13 +507,50 @@ class AgenticHeadlessController(http.Controller):
                 "private_methods_blocked": True,
                 "max_search_read_limit": MAX_LIMIT,
                 "audit_log_model": model_exists("agentic.request.log"),
+                "audit_log_query_filters": True,
+                "audit_log_retention_days": AUDIT_LOG_RETENTION_DAYS,
                 "approval_queue": False,
             },
             "next_safety_gaps": [
-                "Add query filters and retention controls for agentic.request.log.",
                 "Classify write/call payloads before execution.",
                 "Require explicit approval for financial and destructive workflow transitions.",
             ],
+        })
+
+    @http.route(
+        "/agentic/v1/audit_logs",
+        type="http",
+        auth="public",
+        methods=["GET", "POST"],
+        csrf=False,
+        cors="*",
+    )
+    def audit_logs(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        if not model_exists("agentic.request.log") or not table_exists("agentic_request_log"):
+            return json_error("audit_log_unavailable", "The agentic.request.log model is not installed yet.", 503)
+
+        payload = read_json()
+        limit = min(bounded_limit(payload.get("limit", 50)), MAX_AUDIT_LOG_LIMIT)
+        offset = bounded_offset(payload.get("offset"))
+        include_payloads = optional_bool(payload.get("include_payloads"))
+        if include_payloads is None:
+            include_payloads = False
+        domain = audit_log_domain(payload)
+        log_model = request.env["agentic.request.log"].sudo()
+        logs = log_model.search(domain, order="create_date desc, id desc", limit=limit, offset=offset)
+
+        return json_response({
+            "ok": True,
+            "database": getattr(request.env.cr, "dbname", None),
+            "filters": audit_log_filter_summary(payload, domain, limit, offset, include_payloads),
+            "retention_policy": audit_log_retention_policy(log_model),
+            "count": len(logs),
+            "total_matching": log_model.search_count(domain),
+            "logs": [serialize_audit_log(log, include_payloads) for log in logs],
         })
 
     @http.route(
@@ -1209,6 +1256,111 @@ def business_event_insights(events, model_results):
     return insights
 
 
+def audit_log_domain(payload):
+    domain = []
+    for field_name in ["endpoint", "operation", "model_name", "error_code"]:
+        value = required_string(payload, field_name)
+        if value:
+            domain.append((field_name, "=", value))
+
+    for field_name in ["ok", "authenticated"]:
+        value = optional_bool(payload.get(field_name))
+        if value is not None:
+            domain.append((field_name, "=", value))
+
+    try:
+        status_min = int(payload.get("status_min")) if payload.get("status_min") is not None else None
+    except (TypeError, ValueError):
+        status_min = None
+    try:
+        status_max = int(payload.get("status_max")) if payload.get("status_max") is not None else None
+    except (TypeError, ValueError):
+        status_max = None
+    if status_min is not None:
+        domain.append(("status_code", ">=", status_min))
+    if status_max is not None:
+        domain.append(("status_code", "<=", status_max))
+
+    since_days = payload.get("since_days")
+    if since_days is not None:
+        since = odoo_fields.Datetime.now() - timedelta(days=bounded_days(since_days))
+        domain.append(("create_date", ">=", odoo_fields.Datetime.to_string(since)))
+
+    return domain
+
+
+def optional_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+    return None
+
+
+def audit_log_filter_summary(payload, domain, limit, offset, include_payloads):
+    return {
+        "endpoint": required_string(payload, "endpoint") or None,
+        "operation": required_string(payload, "operation") or None,
+        "model_name": required_string(payload, "model_name") or None,
+        "error_code": required_string(payload, "error_code") or None,
+        "ok": optional_bool(payload.get("ok")),
+        "authenticated": optional_bool(payload.get("authenticated")),
+        "status_min": payload.get("status_min"),
+        "status_max": payload.get("status_max"),
+        "since_days": payload.get("since_days"),
+        "limit": limit,
+        "offset": offset,
+        "include_payloads": include_payloads,
+        "domain": domain,
+    }
+
+
+def audit_log_retention_policy(log_model):
+    cutoff = odoo_fields.Datetime.now() - timedelta(days=AUDIT_LOG_RETENTION_DAYS)
+    cutoff_string = odoo_fields.Datetime.to_string(cutoff)
+    expired_count = log_model.search_count([("create_date", "<", cutoff_string)])
+    return {
+        "retention_days": AUDIT_LOG_RETENTION_DAYS,
+        "cutoff": cutoff_string,
+        "expired_count": expired_count,
+        "control": "Review expired_count here before adding a scheduled pruning job or explicit prune endpoint.",
+    }
+
+
+def serialize_audit_log(log, include_payloads):
+    item = {
+        "id": log.id,
+        "created_at": log.create_date,
+        "endpoint": log.endpoint,
+        "method": log.method,
+        "operation": log.operation,
+        "model": log.model_name,
+        "status_code": log.status_code,
+        "ok": log.ok,
+        "error_code": log.error_code,
+        "authenticated": log.authenticated,
+        "remote_addr": log.remote_addr,
+        "user_agent": log.user_agent,
+    }
+    if include_payloads:
+        item.update({
+            "payload": parse_logged_json(log.payload_json),
+            "response": parse_logged_json(log.response_json),
+        })
+    return item
+
+
+def parse_logged_json(value):
+    try:
+        return json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return value
+
+
 def domain_capability(model_name, domain_name, requested_fields):
     if not model_exists(model_name):
         return {
@@ -1490,6 +1642,14 @@ def bounded_days(value):
     except (TypeError, ValueError):
         days = 7
     return max(1, min(days, 90))
+
+
+def bounded_offset(value):
+    try:
+        offset = int(value)
+    except (TypeError, ValueError):
+        offset = 0
+    return max(0, offset)
 
 
 def jsonable(value):

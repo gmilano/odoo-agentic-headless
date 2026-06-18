@@ -23,7 +23,7 @@ and which agent can safely execute it.
 
 - [x] `AH-0005` Add persistent `agentic.request.log` model for every API call.
 - [ ] `AH-0010` Add `/agentic/v1/execute_plan`: execute approved action plans with audit log and rollback hints.
-- [ ] `AH-0011` Add audit-log query filters and retention policy for agent reviews.
+- [x] `AH-0011` Add audit-log query filters and retention policy for agent reviews.
 
 ## P1 — SAP-Replacement Demo Surface
 
@@ -63,3 +63,4 @@ Every day at 08:00 America/Montevideo:
 - 2026-06-16 08:01 America/Montevideo: completed `AH-0008` with authenticated `GET|POST /agentic/v1/business_events`. It normalizes recent CRM, Sales, Inventory, Accounting, and Project record activity from `create_date`/`write_date`, returns domain coverage, event summaries, actor metadata, signals, and quiet-domain insights. Verified syntax, health, and endpoint smoke against the running Docker Odoo. Follow-up: implement `AH-0009` action-plan generation using capabilities, business snapshots, and business events as planning context.
 - 2026-06-17 08:02 America/Montevideo: completed `AH-0009` with authenticated `POST /agentic/v1/action_plan`. It maps common natural-language ERP goals into typed non-executing operation plans, exposes risk/approval metadata, blocks plans when required Odoo models are unavailable, and documents the future `execute_plan` contract. Verified syntax, health, and endpoint smoke against Docker Odoo. Follow-up: implement `AH-0010` to execute reviewed plans with audit log links and rollback hints.
 - 2026-06-17 10:55 America/Montevideo: completed `AH-0012` after Google Cloud introduced Open Knowledge Format (OKF). Added authenticated `GET|POST /agentic/v1/okf_bundle`, producing OKF v0.1 Markdown file entries for company context, capabilities, ERP domains, operations, and update log. Follow-up: materialize bundles to git and build a viewer/indexer so the ERP becomes an agent-readable business wiki.
+- 2026-06-18 08:03 America/Montevideo: completed `AH-0011` with authenticated `GET|POST /agentic/v1/audit_logs`. It filters `agentic.request.log` by endpoint, operation, model, status, auth result, error code, and recent window, optionally includes captured payload/response JSON, and reports a 90-day retention policy with expired-log counts. Follow-up: implement `AH-0010` on top of this audit trail so approved execution can link every operation to reviewable logs and rollback hints.
