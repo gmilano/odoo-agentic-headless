@@ -51,6 +51,15 @@ ALLOWED_OPERATIONS = [
         "executes": False,
     },
     {
+        "name": "execute_plan",
+        "endpoint": "/agentic/v1/execute_plan",
+        "method": "POST",
+        "risk": "high",
+        "effect": "execute_approved_action_plan_operations",
+        "executes": True,
+        "requires_approval": True,
+    },
+    {
         "name": "okf_bundle",
         "endpoint": "/agentic/v1/okf_bundle",
         "method": "GET|POST",
@@ -509,11 +518,12 @@ class AgenticHeadlessController(http.Controller):
                 "audit_log_model": model_exists("agentic.request.log"),
                 "audit_log_query_filters": True,
                 "audit_log_retention_days": AUDIT_LOG_RETENTION_DAYS,
+                "approved_plan_execution": True,
                 "approval_queue": False,
             },
             "next_safety_gaps": [
                 "Classify write/call payloads before execution.",
-                "Require explicit approval for financial and destructive workflow transitions.",
+                "Add a persistent approval queue for financial and destructive workflow transitions.",
             ],
         })
 
@@ -596,15 +606,66 @@ class AgenticHeadlessController(http.Controller):
                 "operations": template["operations"],
                 "execution_contract": {
                     "execute_endpoint": "/agentic/v1/execute_plan",
-                    "available": False,
-                    "current_next_step": "Review and fill payload_template values, then execute manually through existing endpoints until AH-0010 exists.",
+                    "available": True,
+                    "current_next_step": "Review, replace payload_template placeholders with concrete payload values, then call execute_plan with approved=true.",
                 },
             },
             "guardrails": [
                 "This endpoint never creates, writes, confirms, posts, cancels, or calls model methods.",
-                "Financial, inventory workflow, and arbitrary method actions remain approval-required.",
+                "Financial, inventory workflow, and arbitrary method actions remain approval-required and may be blocked by execute_plan until a queue exists.",
                 "Use search_read/schema/capabilities to resolve IDs and validate fields before execution.",
             ],
+        })
+
+    @http.route(
+        "/agentic/v1/execute_plan",
+        type="http",
+        auth="public",
+        methods=["POST"],
+        csrf=False,
+        cors="*",
+    )
+    def execute_plan(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        payload = read_json()
+        approved = optional_bool(payload.get("approved"))
+        if approved is not True:
+            return json_error("approval_required", "Expected approved=true before executing a plan.", 403)
+
+        approval_reference = required_string(payload, "approval_reference")
+        plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
+        operations = plan.get("operations") if isinstance(plan, dict) else None
+        if not isinstance(operations, list) or not operations:
+            return json_error("invalid_plan", "Expected a non-empty operations list.", 400)
+        if len(operations) > 10:
+            return json_error("too_many_operations", "execute_plan accepts at most 10 operations per request.", 400)
+
+        normalized, validation_error = normalize_execution_operations(operations)
+        if validation_error:
+            return validation_error
+
+        results = []
+        try:
+            with request.env.cr.savepoint():
+                for operation in normalized:
+                    results.append(execute_operation(operation))
+        except ExecutionPlanError as error:
+            return json_error(error.code, error.message, error.status)
+
+        return json_response({
+            "ok": True,
+            "approved": True,
+            "approval_reference": approval_reference or None,
+            "executed_count": len(results),
+            "results": results,
+            "audit": {
+                "request_log": "This execute_plan request and response are captured in agentic.request.log.",
+                "rollback_scope": "Operations run inside one database savepoint; execution errors roll back this plan batch.",
+            },
+            "rollback_hints": rollback_hints(normalized, results),
         })
 
     @http.route(
@@ -1392,6 +1453,164 @@ def domain_capability(model_name, domain_name, requested_fields):
             for field_name in field_names
         ],
     }
+
+
+class ExecutionPlanError(Exception):
+    def __init__(self, code, message, status=400):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+
+
+def normalize_execution_operations(operations):
+    normalized = []
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, dict):
+            return None, json_error("invalid_operation", f"Operation {index} must be an object.", 400)
+
+        operation_name = required_string(operation, "operation")
+        if operation_name not in {"search_read", "create", "write"}:
+            return None, json_error(
+                "unsupported_operation",
+                f"Operation {index} uses unsupported operation '{operation_name}'. execute_plan currently supports search_read, create, and write.",
+                400,
+            )
+
+        payload = operation_payload(operation)
+        if not isinstance(payload, dict):
+            return None, json_error("invalid_operation_payload", f"Operation {index} must include an object payload.", 400)
+        if contains_placeholder(payload):
+            return None, json_error(
+                "unresolved_placeholder",
+                f"Operation {index} still contains '<...>' placeholders. Replace templates with concrete values before execution.",
+                400,
+            )
+
+        model_name = required_string(payload, "model") or required_string(operation, "model")
+        if not model_name:
+            return None, json_error("missing_model", f"Operation {index} is missing a model.", 400)
+        if not model_exists(model_name):
+            return None, json_error("unknown_model", f"Operation {index} references unknown model: {model_name}", 404)
+        if operation_name in {"create", "write"} and model_name == "account.move":
+            return None, json_error(
+                "financial_write_blocked",
+                "execute_plan blocks account.move writes until the approval queue and financial risk classifier exist.",
+                403,
+            )
+
+        normalized.append({
+            "index": index,
+            "operation": operation_name,
+            "model": model_name,
+            "payload": payload,
+            "purpose": operation.get("purpose"),
+        })
+    return normalized, None
+
+
+def operation_payload(operation):
+    payload = operation.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    payload_template = operation.get("payload_template")
+    if isinstance(payload_template, dict):
+        return payload_template
+    return None
+
+
+def contains_placeholder(value):
+    if isinstance(value, str):
+        return "<" in value and ">" in value
+    if isinstance(value, list):
+        return any(contains_placeholder(item) for item in value)
+    if isinstance(value, tuple):
+        return any(contains_placeholder(item) for item in value)
+    if isinstance(value, dict):
+        return any(contains_placeholder(item) for item in value.values())
+    return False
+
+
+def execute_operation(operation):
+    model = request.env[operation["model"]].sudo().with_context(agentic_headless=True)
+    payload = operation["payload"]
+    operation_name = operation["operation"]
+
+    if operation_name == "search_read":
+        rows = model.search_read(
+            domain=payload.get("domain") or [],
+            fields=payload.get("fields"),
+            offset=bounded_offset(payload.get("offset")),
+            limit=bounded_limit(payload.get("limit", 80)),
+            order=payload.get("order"),
+        )
+        return {
+            "index": operation["index"],
+            "operation": operation_name,
+            "model": operation["model"],
+            "ok": True,
+            "count": len(rows),
+            "rows": rows,
+        }
+
+    if operation_name == "create":
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            raise ExecutionPlanError("invalid_values", f"Operation {operation['index']} expected object field 'values'.")
+        record = model.create(values)
+        return {
+            "index": operation["index"],
+            "operation": operation_name,
+            "model": operation["model"],
+            "ok": True,
+            "id": record.id,
+            "display_name": record.display_name,
+        }
+
+    if operation_name == "write":
+        ids = payload.get("ids")
+        values = payload.get("values")
+        if not isinstance(ids, list) or not all(isinstance(item, int) for item in ids):
+            raise ExecutionPlanError("invalid_ids", f"Operation {operation['index']} expected integer list field 'ids'.")
+        if not isinstance(values, dict):
+            raise ExecutionPlanError("invalid_values", f"Operation {operation['index']} expected object field 'values'.")
+        records = model.browse(ids).exists()
+        records.write(values)
+        return {
+            "index": operation["index"],
+            "operation": operation_name,
+            "model": operation["model"],
+            "ok": True,
+            "updated": len(records),
+            "ids": records.ids,
+        }
+
+    raise ExecutionPlanError("unsupported_operation", f"Unsupported operation: {operation_name}")
+
+
+def rollback_hints(operations, results):
+    hints = []
+    for operation, result in zip(operations, results):
+        if operation["operation"] == "create":
+            hints.append({
+                "operation_index": operation["index"],
+                "created_model": operation["model"],
+                "created_id": result.get("id"),
+                "hint": "Review and archive/delete the created record if the approved action was wrong.",
+            })
+        elif operation["operation"] == "write":
+            hints.append({
+                "operation_index": operation["index"],
+                "updated_model": operation["model"],
+                "updated_ids": result.get("ids", []),
+                "hint": "Use audit payloads to inspect intended values; field-level previous values are not captured yet.",
+            })
+    if not hints:
+        hints.append({
+            "operation_index": None,
+            "hint": "Read-only operations do not require rollback.",
+        })
+    return hints
 
 
 def select_action_plan_template(goal):
