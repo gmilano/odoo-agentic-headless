@@ -524,6 +524,7 @@ class AgenticHeadlessController(http.Controller):
             "next_safety_gaps": [
                 "Classify write/call payloads before execution.",
                 "Add a persistent approval queue for financial and destructive workflow transitions.",
+                "Promote execute_plan rollback payloads into a reviewed reversal workflow.",
             ],
         })
 
@@ -1575,6 +1576,7 @@ def execute_operation(operation):
         if not isinstance(values, dict):
             raise ExecutionPlanError("invalid_values", f"Operation {operation['index']} expected object field 'values'.")
         records = model.browse(ids).exists()
+        previous_values = previous_field_values(records, values)
         records.write(values)
         return {
             "index": operation["index"],
@@ -1583,6 +1585,8 @@ def execute_operation(operation):
             "ok": True,
             "updated": len(records),
             "ids": records.ids,
+            "previous_values": previous_values,
+            "rollback_plan": rollback_plan_for_previous_values(operation["model"], previous_values),
         }
 
     raise ExecutionPlanError("unsupported_operation", f"Unsupported operation: {operation_name}")
@@ -1603,7 +1607,9 @@ def rollback_hints(operations, results):
                 "operation_index": operation["index"],
                 "updated_model": operation["model"],
                 "updated_ids": result.get("ids", []),
-                "hint": "Use audit payloads to inspect intended values; field-level previous values are not captured yet.",
+                "previous_values": result.get("previous_values", []),
+                "rollback_plan": result.get("rollback_plan"),
+                "hint": "Review the captured previous values, then execute the rollback plan only after a fresh approval.",
             })
     if not hints:
         hints.append({
@@ -1611,6 +1617,43 @@ def rollback_hints(operations, results):
             "hint": "Read-only operations do not require rollback.",
         })
     return hints
+
+
+def previous_field_values(records, values):
+    if not records or not isinstance(values, dict):
+        return []
+
+    field_names = [field for field in values if field in records._fields]
+    if not field_names:
+        return []
+
+    return [
+        {
+            "id": item["id"],
+            "values": {
+                field: jsonable(item.get(field))
+                for field in field_names
+            },
+        }
+        for item in records.read(field_names)
+    ]
+
+
+def rollback_plan_for_previous_values(model_name, previous_values):
+    return {
+        "operations": [
+            {
+                "operation": "write",
+                "model": model_name,
+                "payload": {
+                    "model": model_name,
+                    "ids": [item["id"]],
+                    "values": item["values"],
+                },
+            }
+            for item in previous_values
+        ],
+    }
 
 
 def select_action_plan_template(goal):

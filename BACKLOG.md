@@ -33,7 +33,7 @@ and which agent can safely execute it.
 - [ ] `AH-0104` Add permission profiles: executive read-only, ops operator, finance operator, admin.
 - [ ] `AH-0105` Add risk classifier for destructive or financial operations.
 - [ ] `AH-0106` Add approval queue inside Odoo for risky agent actions.
-- [ ] `AH-0108` Capture previous field values for approved writes so rollback hints can become concrete reversal payloads.
+- [x] `AH-0108` Capture previous field values for approved writes so rollback hints can become concrete reversal plans.
 - [ ] `AH-0107` Materialize OKF bundles to disk/git and add a static graph viewer for business concepts.
 
 ## P2 — Market Story
@@ -66,3 +66,4 @@ Every day at 08:00 America/Montevideo:
 - 2026-06-17 10:55 America/Montevideo: completed `AH-0012` after Google Cloud introduced Open Knowledge Format (OKF). Added authenticated `GET|POST /agentic/v1/okf_bundle`, producing OKF v0.1 Markdown file entries for company context, capabilities, ERP domains, operations, and update log. Follow-up: materialize bundles to git and build a viewer/indexer so the ERP becomes an agent-readable business wiki.
 - 2026-06-18 08:03 America/Montevideo: completed `AH-0011` with authenticated `GET|POST /agentic/v1/audit_logs`. It filters `agentic.request.log` by endpoint, operation, model, status, auth result, error code, and recent window, optionally includes captured payload/response JSON, and reports a 90-day retention policy with expired-log counts. Follow-up: implement `AH-0010` on top of this audit trail so approved execution can link every operation to reviewable logs and rollback hints.
 - 2026-06-19 08:01 America/Montevideo: completed `AH-0010` with authenticated `POST /agentic/v1/execute_plan`. It requires `approved=true`, executes up to 10 reviewed `search_read`/`create`/`write` operations in one savepoint, rejects unresolved `<...>` placeholders, blocks unsupported `call` and financial writes, reports audit/rollback metadata, and exposes the endpoint through capabilities/action-plan contracts. Verified syntax, health, 403 approval guard, approved read execution, and capabilities smoke. Follow-up: implement `AH-0106` approval queue and `AH-0108` previous-value rollback capture.
+- 2026-06-20 08:01 America/Montevideo: completed `AH-0108` by capturing previous field values before approved `execute_plan` writes and returning concrete rollback plans in operation results and rollback hints. Verified syntax, health, and approved write smoke against Docker Odoo. Follow-up: implement `AH-0106` approval queue so risky rollback plans can be reviewed and executed through a durable approval workflow.
