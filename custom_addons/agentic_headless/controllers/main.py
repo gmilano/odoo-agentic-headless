@@ -1,6 +1,8 @@
 import json
 import os
 from datetime import timedelta
+from html import escape
+from urllib.parse import quote
 
 from odoo import fields as odoo_fields
 from odoo import http
@@ -308,6 +310,128 @@ ACTION_PLAN_TEMPLATES = [
 
 
 class AgenticHeadlessController(http.Controller):
+    @http.route(
+        "/agentic/ui/approvals",
+        type="http",
+        auth="user",
+        methods=["GET"],
+    )
+    def mobile_approvals(self, **_kwargs):
+        approval_reference = required_string(request.params, "approval_reference")
+        notice = required_string(request.params, "notice")
+        error = required_string(request.params, "error")
+        domain = []
+        if approval_reference:
+            domain.append(("approval_reference", "=", approval_reference))
+        records = request.env["agentic.approval.request"].sudo().search(
+            domain,
+            order="create_date desc, id desc",
+            limit=20,
+        )
+        return html_response(render_mobile_approvals(records, notice=notice, error=error))
+
+    @http.route(
+        "/agentic/ui/approvals/demo",
+        type="http",
+        auth="user",
+        methods=["POST"],
+        csrf=False,
+    )
+    def mobile_create_demo_approval(self, **_kwargs):
+        if not approval_queue_available():
+            return redirect_mobile_approvals(error="Approval queue is not installed yet.")
+
+        operation = demo_write_operation()
+        normalized, validation_error = normalize_execution_operations([operation])
+        if validation_error:
+            return redirect_mobile_approvals(error="Demo operation could not be normalized.")
+
+        goal = "Escalate Glob.ai demo customer follow-up"
+        plan = {
+            "title": goal,
+            "operations": [operation],
+            "demo_story": "Agent proposes a customer-risk write. Odoo requires operator approval before execution.",
+        }
+        record = request.env["agentic.approval.request"].sudo().create({
+            "name": goal,
+            "goal": goal,
+            "requested_by": request.env.user.display_name,
+            "risk": infer_operations_risk(normalized),
+            "plan_json": json.dumps(plan, indent=2, default=str),
+            "normalized_operations_json": json.dumps(normalized, indent=2, default=str),
+            "approval_note": "Mobile demo request generated from /agentic/ui/approvals.",
+        })
+        return redirect_mobile_approvals(
+            approval_reference=record.approval_reference,
+            notice=f"Created {record.approval_reference}. Review and approve it before execution.",
+        )
+
+    @http.route(
+        "/agentic/ui/approvals/<int:approval_id>/approve",
+        type="http",
+        auth="user",
+        methods=["POST"],
+        csrf=False,
+    )
+    def mobile_approve_approval(self, approval_id, **_kwargs):
+        record = request.env["agentic.approval.request"].sudo().browse(approval_id).exists()
+        if not record:
+            return redirect_mobile_approvals(error="Approval request not found.")
+        if record.status != "pending":
+            return redirect_mobile_approvals(approval_reference=record.approval_reference, error=f"{record.approval_reference} is {record.status}.")
+        record.action_approve()
+        return redirect_mobile_approvals(approval_reference=record.approval_reference, notice=f"Approved {record.approval_reference}.")
+
+    @http.route(
+        "/agentic/ui/approvals/<int:approval_id>/reject",
+        type="http",
+        auth="user",
+        methods=["POST"],
+        csrf=False,
+    )
+    def mobile_reject_approval(self, approval_id, **_kwargs):
+        record = request.env["agentic.approval.request"].sudo().browse(approval_id).exists()
+        if not record:
+            return redirect_mobile_approvals(error="Approval request not found.")
+        if record.status != "pending":
+            return redirect_mobile_approvals(approval_reference=record.approval_reference, error=f"{record.approval_reference} is {record.status}.")
+        reason = required_string(request.params, "rejection_reason") or "Rejected from mobile review UI."
+        record.write({"rejection_reason": reason})
+        record.action_reject()
+        return redirect_mobile_approvals(approval_reference=record.approval_reference, notice=f"Rejected {record.approval_reference}.")
+
+    @http.route(
+        "/agentic/ui/approvals/<int:approval_id>/execute",
+        type="http",
+        auth="user",
+        methods=["POST"],
+        csrf=False,
+    )
+    def mobile_execute_approval(self, approval_id, **_kwargs):
+        record = request.env["agentic.approval.request"].sudo().browse(approval_id).exists()
+        if not record:
+            return redirect_mobile_approvals(error="Approval request not found.")
+        if record.status != "approved":
+            return redirect_mobile_approvals(approval_reference=record.approval_reference, error=f"{record.approval_reference} must be approved before execution.")
+
+        operations = parse_logged_json(record.normalized_operations_json)
+        if not isinstance(operations, list) or not operations:
+            return redirect_mobile_approvals(approval_reference=record.approval_reference, error="Stored approval operations are invalid.")
+
+        validation = validate_approval_reference(record.approval_reference, operations)
+        if isinstance(validation, Response):
+            return redirect_mobile_approvals(approval_reference=record.approval_reference, error="Approval validation failed.")
+
+        try:
+            with request.env.cr.savepoint():
+                results = [execute_operation(operation) for operation in operations]
+                record.action_mark_consumed()
+                log_ui_execution(record, results)
+        except ExecutionPlanError as exc:
+            return redirect_mobile_approvals(approval_reference=record.approval_reference, error=f"{exc.code}: {exc.message}")
+
+        return redirect_mobile_approvals(approval_reference=record.approval_reference, notice=f"Executed {record.approval_reference}. Audit and rollback details are now available.")
+
     @http.route(
         "/agentic/v1/health",
         type="http",
@@ -730,8 +854,15 @@ class AgenticHeadlessController(http.Controller):
         if validation_error:
             return validation_error
 
+        if requires_durable_approval_reference(normalized) and not is_durable_approval_reference(approval_reference):
+            return json_error(
+                "durable_approval_required",
+                "Medium/high risk create/write operations require an approved AHR approval_reference from /agentic/v1/approval_requests.",
+                403,
+            )
+
         approval_request = None
-        if approval_reference and approval_reference.startswith("AHR-"):
+        if is_durable_approval_reference(approval_reference):
             approval_request = validate_approval_reference(approval_reference, normalized)
             if isinstance(approval_request, Response):
                 return approval_request
@@ -1442,6 +1573,283 @@ def audit_log_domain(payload):
     return domain
 
 
+def render_mobile_approvals(records, notice=None, error=None):
+    cards = "\n".join(render_mobile_approval_card(record) for record in records)
+    if not cards:
+        cards = """
+        <section class="empty">
+            <h2>No approval requests yet</h2>
+            <p>Create a demo request to show the full agentic ERP review flow.</p>
+        </section>
+        """
+
+    notice_html = f'<div class="notice">{escape(notice)}</div>' if notice else ""
+    error_html = f'<div class="error">{escape(error)}</div>' if error else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agentic ERP Approvals</title>
+    <style>
+        :root {{
+            color-scheme: light;
+            --bg: #f7f8fb;
+            --ink: #172033;
+            --muted: #667085;
+            --line: #d9dee8;
+            --card: #ffffff;
+            --accent: #155eef;
+            --ok: #067647;
+            --warn: #b54708;
+            --bad: #b42318;
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            background: var(--bg);
+            color: var(--ink);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            line-height: 1.35;
+        }}
+        header {{
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            padding: 18px 16px 14px;
+            background: rgba(247, 248, 251, .94);
+            border-bottom: 1px solid var(--line);
+            backdrop-filter: blur(12px);
+        }}
+        h1 {{ margin: 0; font-size: 24px; letter-spacing: 0; }}
+        h2 {{ margin: 0 0 6px; font-size: 18px; }}
+        .sub {{ margin-top: 5px; color: var(--muted); font-size: 14px; }}
+        main {{ max-width: 760px; margin: 0 auto; padding: 16px; }}
+        .actions {{
+            display: grid;
+            gap: 10px;
+            margin: 0 0 14px;
+        }}
+        .card, .empty {{
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 14px;
+            margin-bottom: 12px;
+            box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
+        }}
+        .topline {{
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 8px;
+        }}
+        .ref {{ font-size: 18px; font-weight: 700; }}
+        .goal {{ font-size: 15px; margin: 4px 0 0; color: var(--muted); }}
+        .chips {{ display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }}
+        .chip {{
+            display: inline-flex;
+            align-items: center;
+            min-height: 26px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            font-size: 12px;
+            color: var(--muted);
+            background: #f9fafb;
+        }}
+        .chip.pending {{ color: var(--warn); background: #fffaeb; border-color: #fedf89; }}
+        .chip.approved {{ color: var(--ok); background: #ecfdf3; border-color: #abefc6; }}
+        .chip.rejected, .chip.cancelled {{ color: var(--bad); background: #fef3f2; border-color: #fecdca; }}
+        .chip.consumed {{ color: #344054; background: #eef4ff; border-color: #c7d7fe; }}
+        pre {{
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            background: #101828;
+            color: #f2f4f7;
+            border-radius: 8px;
+            padding: 12px;
+            font-size: 12px;
+            line-height: 1.4;
+            max-height: 260px;
+            overflow: auto;
+        }}
+        button {{
+            width: 100%;
+            min-height: 44px;
+            border: 0;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 15px;
+            font-weight: 700;
+            background: var(--accent);
+            color: white;
+        }}
+        .secondary {{ background: #344054; }}
+        .danger {{ background: var(--bad); }}
+        .ghost {{
+            background: white;
+            color: var(--ink);
+            border: 1px solid var(--line);
+        }}
+        form {{ margin: 0; }}
+        .buttonrow {{
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
+            margin-top: 10px;
+        }}
+        .notice, .error {{
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            font-size: 14px;
+            border: 1px solid;
+        }}
+        .notice {{ background: #ecfdf3; border-color: #abefc6; color: var(--ok); }}
+        .error {{ background: #fef3f2; border-color: #fecdca; color: var(--bad); }}
+        .meta {{ color: var(--muted); font-size: 12px; margin-top: 8px; }}
+        @media (min-width: 620px) {{
+            .actions {{ grid-template-columns: 1fr 1fr; }}
+            .buttonrow {{ grid-template-columns: repeat(3, 1fr); }}
+        }}
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Agentic ERP</h1>
+        <div class="sub">Human approval queue for risky Odoo agent actions</div>
+    </header>
+    <main>
+        {notice_html}
+        {error_html}
+        <section class="actions">
+            <form method="post" action="/agentic/ui/approvals/demo">
+                <button type="submit">Create demo approval</button>
+            </form>
+            <form method="get" action="/web">
+                <button class="ghost" type="submit">Open Odoo backend</button>
+            </form>
+        </section>
+        {cards}
+    </main>
+</body>
+</html>"""
+
+
+def render_mobile_approval_card(record):
+    plan = escape(record.plan_json or "{}")
+    status = escape(record.status or "")
+    risk = escape(record.risk or "")
+    ref = escape(record.approval_reference or "")
+    goal = escape(record.goal or record.name or "")
+    requested_by = escape(record.requested_by or "agent")
+    created = escape(str(record.create_date or ""))
+    approved_by = escape(record.approved_by_id.display_name if record.approved_by_id else "")
+    buttons = render_mobile_approval_buttons(record)
+    approved_by_html = f'<span class="chip">approved by {approved_by}</span>' if approved_by else ""
+    return f"""
+    <section class="card">
+        <div class="topline">
+            <div>
+                <div class="ref">{ref}</div>
+                <p class="goal">{goal}</p>
+            </div>
+            <span class="chip {status}">{status}</span>
+        </div>
+        <div class="chips">
+            <span class="chip">risk: {risk}</span>
+            <span class="chip">requested by {requested_by}</span>
+            {approved_by_html}
+        </div>
+        <pre>{plan}</pre>
+        {buttons}
+        <div class="meta">Created {created}. Execution consumes the approval and records rollback hints in the audit trail.</div>
+    </section>
+    """
+
+
+def render_mobile_approval_buttons(record):
+    if record.status == "pending":
+        return f"""
+        <div class="buttonrow">
+            <form method="post" action="/agentic/ui/approvals/{record.id}/approve">
+                <button type="submit">Approve</button>
+            </form>
+            <form method="post" action="/agentic/ui/approvals/{record.id}/reject">
+                <button class="danger" type="submit">Reject</button>
+            </form>
+            <form method="get" action="/web#id={record.id}&model=agentic.approval.request&view_type=form">
+                <button class="ghost" type="submit">Backend</button>
+            </form>
+        </div>
+        """
+    if record.status == "approved":
+        return f"""
+        <div class="buttonrow">
+            <form method="post" action="/agentic/ui/approvals/{record.id}/execute">
+                <button class="secondary" type="submit">Execute approved plan</button>
+            </form>
+            <form method="get" action="/web#id={record.id}&model=agentic.approval.request&view_type=form">
+                <button class="ghost" type="submit">Backend</button>
+            </form>
+        </div>
+        """
+    return f"""
+    <div class="buttonrow">
+        <form method="get" action="/web#id={record.id}&model=agentic.approval.request&view_type=form">
+            <button class="ghost" type="submit">Backend</button>
+        </form>
+    </div>
+    """
+
+
+def html_response(html, status=200):
+    return Response(html, status=status, content_type="text/html; charset=utf-8")
+
+
+def redirect_mobile_approvals(approval_reference=None, notice=None, error=None):
+    params = []
+    if approval_reference:
+        params.append(f"approval_reference={quote(str(approval_reference))}")
+    if notice:
+        params.append(f"notice={quote(str(notice))}")
+    if error:
+        params.append(f"error={quote(str(error))}")
+    suffix = "?" + "&".join(params) if params else ""
+    return request.redirect(f"/agentic/ui/approvals{suffix}")
+
+
+def log_ui_execution(record, results):
+    if not model_exists("agentic.request.log") or not table_exists("agentic_request_log"):
+        return
+    operations = parse_logged_json(record.normalized_operations_json)
+    request.env["agentic.request.log"].sudo().create({
+        "name": f"UI execute {record.approval_reference}",
+        "endpoint": "/agentic/ui/approvals/execute",
+        "method": "POST",
+        "operation": "execute_plan",
+        "model_name": "agentic.approval.request",
+        "status_code": 200,
+        "ok": True,
+        "authenticated": True,
+        "remote_addr": request.httprequest.remote_addr,
+        "user_agent": request.httprequest.user_agent.string,
+        "payload_json": truncated_json({
+            "approval_reference": record.approval_reference,
+            "operations": operations,
+        }),
+        "response_json": truncated_json({
+            "ok": True,
+            "approval_reference": record.approval_reference,
+            "executed_count": len(results),
+            "results": results,
+            "rollback_hints": rollback_hints(operations, results),
+        }),
+    })
+
+
 def optional_bool(value):
     if isinstance(value, bool):
         return value
@@ -1591,6 +1999,14 @@ def infer_operations_risk(operations):
     return "low"
 
 
+def requires_durable_approval_reference(operations):
+    return infer_operations_risk(operations) in {"medium", "high"}
+
+
+def is_durable_approval_reference(value):
+    return bool(value and isinstance(value, str) and value.startswith("AHR-"))
+
+
 def validate_approval_reference(approval_reference, normalized_operations):
     if not approval_queue_available():
         return json_error("approval_queue_unavailable", "The approval queue is not installed; use an external approval reference.", 503)
@@ -1620,6 +2036,94 @@ def validate_approval_reference(approval_reference, normalized_operations):
 
 def comparable_operations(operations):
     return json.dumps(operations, default=str, sort_keys=True)
+
+
+def demo_write_operation():
+    if model_exists("crm.lead"):
+        lead = demo_crm_lead()
+        values = {}
+        if "probability" in lead._fields:
+            values["probability"] = 88
+        if "priority" in lead._fields:
+            values["priority"] = "3"
+        if not values and "description" in lead._fields:
+            values["description"] = "Agentic ERP demo: escalated from mobile approval UI."
+        if values:
+            return {
+                "operation": "write",
+                "purpose": "Escalate a strategic CRM opportunity after agent review.",
+                "payload": {
+                    "model": "crm.lead",
+                    "ids": [lead.id],
+                    "values": values,
+                },
+            }
+
+    partner = demo_partner()
+    field_name = demo_partner_write_field()
+    return {
+        "operation": "write",
+        "purpose": "Mark a strategic customer for proactive executive follow-up.",
+        "payload": {
+            "model": "res.partner",
+            "ids": [partner.id],
+            "values": {
+                field_name: demo_partner_field_value(field_name),
+            },
+        },
+    }
+
+
+def demo_crm_lead():
+    partner = demo_partner()
+    lead_model = request.env["crm.lead"].sudo()
+    lead = lead_model.search([("name", "=", "Glob.ai Renewal - South Region")], limit=1)
+    if lead:
+        return lead
+    values = {
+        "name": "Glob.ai Renewal - South Region",
+        "partner_id": partner.id,
+        "expected_revenue": 185000,
+        "probability": 62,
+    }
+    if "type" in lead_model._fields:
+        values["type"] = "opportunity"
+    if "priority" in lead_model._fields:
+        values["priority"] = "2"
+    return lead_model.create(values)
+
+
+def demo_partner():
+    partner_model = request.env["res.partner"].sudo()
+    partner = partner_model.search([("name", "=", "Glob.ai Demo Customer")], limit=1)
+    if partner:
+        return partner
+    return partner_model.create({
+        "name": "Glob.ai Demo Customer",
+        "email": "buyer@globai-demo.example",
+        "phone": "+598 2900 0000",
+        "website": "https://glob.ai",
+    })
+
+
+def demo_partner_write_field():
+    fields = request.env["res.partner"]._fields
+    for field_name in ["comment", "website", "phone", "email"]:
+        if field_name in fields:
+            return field_name
+    return "name"
+
+
+def demo_partner_field_value(field_name):
+    if field_name == "comment":
+        return "Agentic ERP demo: executive follow-up approved from mobile review UI."
+    if field_name == "website":
+        return "https://glob.ai/demo-approved"
+    if field_name == "phone":
+        return "+598 2900 0001"
+    if field_name == "email":
+        return "approved-buyer@globai-demo.example"
+    return "Glob.ai Demo Customer - Approved"
 
 
 def domain_capability(model_name, domain_name, requested_fields):

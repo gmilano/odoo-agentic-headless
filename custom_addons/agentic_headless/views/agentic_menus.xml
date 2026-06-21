@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <menuitem id="menu_agentic_root" name="Agentic ERP" sequence="80" groups="base.group_system"/>
+    <menuitem id="menu_agentic_approvals" name="Approvals" parent="menu_agentic_root" action="action_agentic_approval_requests" sequence="10"/>
+    <menuitem id="menu_agentic_logs" name="Audit Logs" parent="menu_agentic_root" action="action_agentic_request_logs" sequence="20"/>
+</odoo>

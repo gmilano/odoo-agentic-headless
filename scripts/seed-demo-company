@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DOCKER="${DOCKER:-/opt/homebrew/bin/docker}"
+COMPOSE_API="${DOCKER_API_VERSION:-1.44}"
+DB="${ODOO_DB:-odoo_agentic}"
+
+cd "$ROOT"
+
+DOCKER_API_VERSION="$COMPOSE_API" "$DOCKER" compose exec -T odoo \
+  odoo -d "$DB" -i crm,sale_management,stock,account --stop-after-init --no-http
+
+DOCKER_API_VERSION="$COMPOSE_API" "$DOCKER" compose exec -T odoo \
+  odoo shell -d "$DB" --no-http <<'PY'
+import json
+
+from odoo import Command
+
+def get_or_create(model_name, domain, values):
+    model = env[model_name].sudo()
+    record = model.search(domain, limit=1)
+    if record:
+        record.write(values)
+        return record
+    return model.create(values)
+
+partner = get_or_create("res.partner", [("name", "=", "Glob.ai Demo Customer")], {
+    "name": "Glob.ai Demo Customer",
+    "is_company": True,
+    "email": "buyer@globai-demo.example",
+    "phone": "+598 2900 0000",
+    "website": "https://glob.ai",
+})
+
+supplier = get_or_create("res.partner", [("name", "=", "Andes Components")], {
+    "name": "Andes Components",
+    "is_company": True,
+    "email": "ops@andes-components.example",
+    "phone": "+598 2400 1000",
+})
+
+template_model = env["product.template"].sudo()
+product_values = {
+    "name": "Agentic ERP Control Tower",
+    "sale_ok": True,
+    "purchase_ok": True,
+    "list_price": 185000,
+    "standard_price": 82000,
+}
+if "type" in template_model._fields:
+    product_values["type"] = "consu"
+if "is_storable" in template_model._fields:
+    product_values["is_storable"] = True
+product_template = get_or_create("product.template", [("name", "=", "Agentic ERP Control Tower")], product_values)
+product = product_template.product_variant_id
+
+if "crm.lead" in env.registry.models:
+    lead_model = env["crm.lead"].sudo()
+    lead_values = {
+        "name": "Glob.ai Renewal - South Region",
+        "partner_id": partner.id,
+        "expected_revenue": 185000,
+        "probability": 62,
+    }
+    if "type" in lead_model._fields:
+        lead_values["type"] = "opportunity"
+    if "priority" in lead_model._fields:
+        lead_values["priority"] = "2"
+    get_or_create("crm.lead", [("name", "=", "Glob.ai Renewal - South Region")], lead_values)
+
+if "sale.order" in env.registry.models:
+    order = env["sale.order"].sudo().search([("client_order_ref", "=", "GLOB-AI-DEMO-001")], limit=1)
+    order_values = {
+        "partner_id": partner.id,
+        "client_order_ref": "GLOB-AI-DEMO-001",
+        "origin": "Agentic ERP demo",
+    }
+    if order:
+        order.write(order_values)
+        order.order_line.unlink()
+    else:
+        order = env["sale.order"].sudo().create(order_values)
+    order.write({
+        "order_line": [Command.create({
+            "product_id": product.id,
+            "product_uom_qty": 1,
+            "price_unit": 185000,
+            "name": "Agentic ERP Control Tower - annual subscription",
+        })],
+    })
+
+if "stock.quant" in env.registry.models and "stock.location" in env.registry.models:
+    location = env.ref("stock.stock_location_stock", raise_if_not_found=False)
+    if location and hasattr(env["stock.quant"].sudo(), "_update_available_quantity"):
+        env["stock.quant"].sudo()._update_available_quantity(product, location, 4)
+
+approval_model = env["agentic.approval.request"].sudo()
+existing = approval_model.search([
+    ("goal", "=", "Demo: approve CRM opportunity escalation"),
+    ("status", "in", ["pending", "approved"]),
+], limit=1)
+operation = {
+    "operation": "write",
+    "purpose": "Escalate the Glob.ai renewal opportunity after an agent detects delivery risk.",
+    "payload": {
+        "model": "crm.lead" if "crm.lead" in env.registry.models else "res.partner",
+        "ids": [],
+        "values": {},
+    },
+}
+if "crm.lead" in env.registry.models:
+    lead = env["crm.lead"].sudo().search([("name", "=", "Glob.ai Renewal - South Region")], limit=1)
+    operation["payload"]["ids"] = [lead.id]
+    operation["payload"]["values"] = {"probability": 88}
+    if "priority" in lead._fields:
+        operation["payload"]["values"]["priority"] = "3"
+else:
+    operation["payload"]["ids"] = [partner.id]
+    operation["payload"]["values"] = {"phone": "+598 2900 0001"}
+
+if not existing:
+    approval_model.create({
+        "name": "Demo: approve CRM opportunity escalation",
+        "goal": "Demo: approve CRM opportunity escalation",
+        "requested_by": "seed-demo-company",
+        "risk": "medium",
+        "plan_json": json.dumps({
+            "title": "Demo: approve CRM opportunity escalation",
+            "operations": [operation],
+        }, indent=2),
+        "normalized_operations_json": json.dumps([{
+            "index": 0,
+            "operation": operation["operation"],
+            "model": operation["payload"]["model"],
+            "payload": operation["payload"],
+            "purpose": operation["purpose"],
+        }], indent=2),
+        "approval_note": "Seeded approval for tomorrow's mobile demo.",
+    })
+
+env.cr.commit()
+print("Seeded Glob.ai demo company: customer, supplier, product, CRM lead, sale order, stock and approval request.")
+PY

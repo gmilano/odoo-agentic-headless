@@ -27,14 +27,14 @@ and which agent can safely execute it.
 
 ## P1 — SAP-Replacement Demo Surface
 
-- [ ] `AH-0101` Install and seed CRM/Sales/Inventory/Accounting demo modules for a believable mid-market company.
+- [x] `AH-0101` Install and seed CRM/Sales/Inventory/Accounting demo modules for a believable mid-market company.
 - [ ] `AH-0102` Build executive "business cockpit" JSON: revenue, pipeline, cash, inventory risk, delivery risk.
 - [ ] `AH-0103` Add Claude/Wany tool adapter that maps model tool calls to the headless API.
 - [ ] `AH-0104` Add permission profiles: executive read-only, ops operator, finance operator, admin.
 - [ ] `AH-0105` Add risk classifier for destructive or financial operations.
 - [x] `AH-0106` Add approval queue inside Odoo for risky agent actions.
 - [x] `AH-0108` Capture previous field values for approved writes so rollback hints can become concrete reversal plans.
-- [ ] `AH-0109` Require approved approval-queue references for all medium/high risk writes and add an Odoo review view/menu for operators.
+- [x] `AH-0109` Require approved approval-queue references for all medium/high risk writes and add an Odoo review view/menu for operators.
 - [ ] `AH-0107` Materialize OKF bundles to disk/git and add a static graph viewer for business concepts.
 
 ## P2 — Market Story
@@ -69,3 +69,4 @@ Every day at 08:00 America/Montevideo:
 - 2026-06-19 08:01 America/Montevideo: completed `AH-0010` with authenticated `POST /agentic/v1/execute_plan`. It requires `approved=true`, executes up to 10 reviewed `search_read`/`create`/`write` operations in one savepoint, rejects unresolved `<...>` placeholders, blocks unsupported `call` and financial writes, reports audit/rollback metadata, and exposes the endpoint through capabilities/action-plan contracts. Verified syntax, health, 403 approval guard, approved read execution, and capabilities smoke. Follow-up: implement `AH-0106` approval queue and `AH-0108` previous-value rollback capture.
 - 2026-06-20 08:01 America/Montevideo: completed `AH-0108` by capturing previous field values before approved `execute_plan` writes and returning concrete rollback plans in operation results and rollback hints. Verified syntax, health, and approved write smoke against Docker Odoo. Follow-up: implement `AH-0106` approval queue so risky rollback plans can be reviewed and executed through a durable approval workflow.
 - 2026-06-21 08:01 America/Montevideo: completed the first durable `AH-0106` approval queue with `agentic.approval.request`, authenticated `GET|POST /agentic/v1/approval_requests`, capability metadata, pending/approved/rejected/consumed states, and optional `AHR-...` validation/consumption in `execute_plan`. Verified syntax, module upgrade, health/capabilities, approval create/list, pending approval block, Odoo-side approval, approved execution, and consumed status. Follow-up: implement `AH-0109` so medium/high risk writes must use approved queue references and operators get an Odoo review UI.
+- 2026-06-21 15:05 America/Montevideo: completed `AH-0109` and `AH-0101` for tomorrow's demo. Medium/high risk create/write execution now requires a durable approved `AHR-...` approval reference; Odoo backend menus show Agentic Approvals and Audit Logs; `/agentic/ui/approvals` provides a mobile-first approval UI with create demo, approve, reject, and execute flow; `scripts/seed-demo-company` installs CRM/Sales/Inventory/Accounting and seeds customer, supplier, CRM opportunity, sale order, stock, product, and a pending approval. Verified py_compile, XML parse, module upgrade, health, capabilities, business snapshot, no-AHR write block, pending approval block, approved execution with rollback hints, and UI approve/execute redirects. Follow-up: add an executive cockpit JSON and a polished Glob.ai Router/Wany adapter for live agent chat.

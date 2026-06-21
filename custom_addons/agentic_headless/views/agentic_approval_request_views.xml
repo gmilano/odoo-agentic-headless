@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_agentic_approval_request_list" model="ir.ui.view">
+        <field name="name">agentic.approval.request.list</field>
+        <field name="model">agentic.approval.request</field>
+        <field name="arch" type="xml">
+            <list string="Agentic Approvals" decoration-warning="status == 'pending'" decoration-success="status == 'approved'" decoration-muted="status in ('consumed', 'cancelled')" decoration-danger="status == 'rejected'">
+                <field name="approval_reference"/>
+                <field name="status"/>
+                <field name="risk"/>
+                <field name="goal"/>
+                <field name="requested_by"/>
+                <field name="approved_by_id"/>
+                <field name="approved_at"/>
+                <field name="consumed_at"/>
+                <field name="create_date"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_agentic_approval_request_form" model="ir.ui.view">
+        <field name="name">agentic.approval.request.form</field>
+        <field name="model">agentic.approval.request</field>
+        <field name="arch" type="xml">
+            <form string="Agentic Approval Request">
+                <header>
+                    <button name="action_approve" type="object" string="Approve" class="btn-primary" invisible="status != 'pending'"/>
+                    <button name="action_reject" type="object" string="Reject" invisible="status != 'pending'"/>
+                    <button name="action_cancel" type="object" string="Cancel" invisible="status not in ('pending', 'approved')"/>
+                    <button name="action_open_mobile_review" type="object" string="Mobile Review"/>
+                    <field name="status" widget="statusbar" statusbar_visible="pending,approved,consumed"/>
+                </header>
+                <sheet>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1><field name="name"/></h1>
+                    </div>
+                    <group>
+                        <group>
+                            <field name="approval_reference" readonly="1"/>
+                            <field name="risk"/>
+                            <field name="goal"/>
+                            <field name="requested_by"/>
+                        </group>
+                        <group>
+                            <field name="approved_by_id" readonly="1"/>
+                            <field name="approved_at" readonly="1"/>
+                            <field name="consumed_at" readonly="1"/>
+                            <field name="create_date" readonly="1"/>
+                        </group>
+                    </group>
+                    <notebook>
+                        <page string="Plan">
+                            <field name="plan_json" widget="text"/>
+                        </page>
+                        <page string="Normalized Operations">
+                            <field name="normalized_operations_json" widget="text"/>
+                        </page>
+                        <page string="Review Notes">
+                            <group>
+                                <field name="approval_note"/>
+                                <field name="rejection_reason"/>
+                            </group>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_agentic_approval_request_search" model="ir.ui.view">
+        <field name="name">agentic.approval.request.search</field>
+        <field name="model">agentic.approval.request</field>
+        <field name="arch" type="xml">
+            <search string="Agentic Approvals">
+                <field name="approval_reference"/>
+                <field name="goal"/>
+                <field name="requested_by"/>
+                <filter name="pending" string="Pending" domain="[('status','=','pending')]"/>
+                <filter name="approved" string="Approved" domain="[('status','=','approved')]"/>
+                <filter name="medium_high" string="Medium/High Risk" domain="[('risk','in',['medium','high'])]"/>
+                <group>
+                    <filter name="group_status" string="Status" context="{'group_by':'status'}"/>
+                    <filter name="group_risk" string="Risk" context="{'group_by':'risk'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_agentic_approval_requests" model="ir.actions.act_window">
+        <field name="name">Agentic Approvals</field>
+        <field name="res_model">agentic.approval.request</field>
+        <field name="view_mode">list,form</field>
+        <field name="context">{'search_default_pending': 1}</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">No agentic approval requests yet.</p>
+            <p>Create one through /agentic/v1/approval_requests or the mobile demo page.</p>
+        </field>
+    </record>
+</odoo>

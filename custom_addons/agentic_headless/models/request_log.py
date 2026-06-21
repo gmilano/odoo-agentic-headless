@@ -62,6 +62,14 @@ class AgenticApprovalRequest(models.Model):
     approved_at = fields.Datetime(readonly=True)
     consumed_at = fields.Datetime(readonly=True)
 
+    def action_open_mobile_review(self):
+        self.ensure_one()
+        return {
+            "type": "ir.actions.act_url",
+            "url": f"/agentic/ui/approvals?approval_reference={self.approval_reference}",
+            "target": "self",
+        }
+
     @api.model_create_multi
     def create(self, vals_list):
         records = super().create(vals_list)
@@ -79,6 +87,9 @@ class AgenticApprovalRequest(models.Model):
 
     def action_reject(self):
         self.write({"status": "rejected"})
+
+    def action_cancel(self):
+        self.write({"status": "cancelled"})
 
     def action_mark_consumed(self):
         self.write({

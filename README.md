@@ -60,6 +60,8 @@ Endpoints:
 - `GET|POST /agentic/v1/business_snapshot`
 - `GET|POST /agentic/v1/business_events`
 - `POST /agentic/v1/action_plan`
+- `GET|POST /agentic/v1/approval_requests`
+- `POST /agentic/v1/execute_plan`
 - `GET|POST /agentic/v1/okf_bundle`
 - `POST /agentic/v1/schema`
 - `POST /agentic/v1/search_read`
@@ -116,6 +118,23 @@ The response contains an Open Knowledge Format v0.1 bundle as Markdown file
 entries. Agents can materialize the returned `files[].path` and
 `files[].content` values into a directory, index them, or publish them as an
 agent-readable business wiki.
+
+## Demo
+
+Seed a full CRM/Sales/Inventory/Accounting demo company:
+
+```bash
+scripts/seed-demo-company
+```
+
+Then open the mobile approval UI:
+
+```text
+http://localhost:8069/agentic/ui/approvals
+```
+
+Use Odoo login `admin` / `admin`. The full demo runbook is in
+`docs/DEMO.md`.
 
 ## Product Backlog
 
