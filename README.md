@@ -140,3 +140,8 @@ Use Odoo login `admin` / `admin`. The full demo runbook is in
 
 The working backlog lives in `BACKLOG.md`. The daily implementation ritual lives
 in `docs/DAILY_LOOP.md`.
+
+## License
+
+This project is published under the GNU Lesser General Public License v3.0
+(`LGPL-3.0`), matching the Odoo module manifest.
