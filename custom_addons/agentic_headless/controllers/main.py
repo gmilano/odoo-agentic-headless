@@ -60,6 +60,15 @@ ALLOWED_OPERATIONS = [
         "requires_approval": True,
     },
     {
+        "name": "approval_requests",
+        "endpoint": "/agentic/v1/approval_requests",
+        "method": "GET|POST",
+        "risk": "medium",
+        "effect": "create_or_list_durable_agent_action_approval_requests",
+        "executes": False,
+        "requires_approval": False,
+    },
+    {
         "name": "okf_bundle",
         "endpoint": "/agentic/v1/okf_bundle",
         "method": "GET|POST",
@@ -105,17 +114,17 @@ RISKY_OPERATIONS = [
     {
         "name": "call",
         "reason": "Arbitrary public model methods can trigger workflows, posting, confirmations, or integrations.",
-        "current_guardrail": "Private methods are blocked. Approval queue is not implemented yet.",
+        "current_guardrail": "Private methods are blocked. Durable approval requests exist; call execution remains blocked from execute_plan.",
     },
     {
         "name": "write_financial_records",
         "reason": "Financial records can affect invoices, journals, tax reports, and external accounting state.",
-        "current_guardrail": "Use schema/search_read first; explicit approval will be added in AH-0010/AH-0106.",
+        "current_guardrail": "execute_plan blocks account.move writes until financial risk classification can require an approved queue reference.",
     },
     {
         "name": "confirm_or_cancel_documents",
         "reason": "State-changing workflow methods can commit sales, purchase, stock, manufacturing, or accounting actions.",
-        "current_guardrail": "Treat state transition methods as approval-required through the agent adapter.",
+        "current_guardrail": "Treat state transitions as approval-required and create an approval request before an adapter executes them.",
     },
 ]
 
@@ -519,12 +528,12 @@ class AgenticHeadlessController(http.Controller):
                 "audit_log_query_filters": True,
                 "audit_log_retention_days": AUDIT_LOG_RETENTION_DAYS,
                 "approved_plan_execution": True,
-                "approval_queue": False,
+                "approval_queue": approval_queue_available(),
             },
             "next_safety_gaps": [
                 "Classify write/call payloads before execution.",
-                "Add a persistent approval queue for financial and destructive workflow transitions.",
-                "Promote execute_plan rollback payloads into a reviewed reversal workflow.",
+                "Require approved queue references for all medium/high risk execute_plan writes.",
+                "Promote execute_plan rollback payloads into approval requests for reviewed reversal workflows.",
             ],
         })
 
@@ -562,6 +571,78 @@ class AgenticHeadlessController(http.Controller):
             "count": len(logs),
             "total_matching": log_model.search_count(domain),
             "logs": [serialize_audit_log(log, include_payloads) for log in logs],
+        })
+
+    @http.route(
+        "/agentic/v1/approval_requests",
+        type="http",
+        auth="public",
+        methods=["GET", "POST"],
+        csrf=False,
+        cors="*",
+    )
+    def approval_requests(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        if not approval_queue_available():
+            return json_error("approval_queue_unavailable", "The agentic.approval.request model is not installed yet.", 503)
+
+        payload = read_json()
+        action = required_string(payload, "action")
+        if not action:
+            action = "create" if isinstance(payload.get("plan"), dict) or isinstance(payload.get("operations"), list) else "list"
+
+        approval_model = request.env["agentic.approval.request"].sudo()
+        if action == "create":
+            plan, normalized, validation_error = approval_request_plan_and_ops(payload)
+            if validation_error:
+                return validation_error
+
+            risk = required_string(payload, "risk") or infer_operations_risk(normalized)
+            if risk not in {"low", "medium", "high"}:
+                risk = infer_operations_risk(normalized)
+            goal = required_string(payload, "goal") or plan.get("title") or plan.get("intent") or "Agentic action approval"
+            record = approval_model.create({
+                "name": f"Approval: {goal[:80]}",
+                "goal": goal,
+                "risk": risk,
+                "requested_by": required_string(payload, "requested_by") or "agentic-api",
+                "plan_json": json.dumps(plan, default=str, sort_keys=True),
+                "normalized_operations_json": json.dumps(normalized, default=str, sort_keys=True),
+                "approval_note": required_string(payload, "approval_note"),
+            })
+            return json_response({
+                "ok": True,
+                "approval_request": serialize_approval_request(record, include_plan=True),
+                "execution_contract": {
+                    "execute_endpoint": "/agentic/v1/execute_plan",
+                    "approval_reference": record.approval_reference,
+                    "next_step": "An Odoo operator must approve this request before execute_plan can consume the AHR reference.",
+                },
+            }, status=201)
+
+        if action != "list":
+            return json_error("unsupported_approval_action", "approval_requests supports action=create or action=list.", 400)
+
+        limit = min(bounded_limit(payload.get("limit", 50)), 100)
+        offset = bounded_offset(payload.get("offset"))
+        domain = approval_request_domain(payload)
+        records = approval_model.search(domain, order="create_date desc, id desc", limit=limit, offset=offset)
+        return json_response({
+            "ok": True,
+            "database": getattr(request.env.cr, "dbname", None),
+            "filters": {
+                "status": required_string(payload, "status") or None,
+                "risk": required_string(payload, "risk") or None,
+                "approval_reference": required_string(payload, "approval_reference") or None,
+                "limit": limit,
+                "offset": offset,
+            },
+            "count": len(records),
+            "total_matching": approval_model.search_count(domain),
+            "approval_requests": [serialize_approval_request(record) for record in records],
         })
 
     @http.route(
@@ -608,12 +689,13 @@ class AgenticHeadlessController(http.Controller):
                 "execution_contract": {
                     "execute_endpoint": "/agentic/v1/execute_plan",
                     "available": True,
-                    "current_next_step": "Review, replace payload_template placeholders with concrete payload values, then call execute_plan with approved=true.",
+                    "approval_queue_endpoint": "/agentic/v1/approval_requests",
+                    "current_next_step": "Review, replace payload_template placeholders with concrete payload values, create an approval request, then call execute_plan with approved=true and the approved AHR reference.",
                 },
             },
             "guardrails": [
                 "This endpoint never creates, writes, confirms, posts, cancels, or calls model methods.",
-                "Financial, inventory workflow, and arbitrary method actions remain approval-required and may be blocked by execute_plan until a queue exists.",
+                "Financial, inventory workflow, and arbitrary method actions remain approval-required; use approval_requests for durable review.",
                 "Use search_read/schema/capabilities to resolve IDs and validate fields before execution.",
             ],
         })
@@ -648,11 +730,19 @@ class AgenticHeadlessController(http.Controller):
         if validation_error:
             return validation_error
 
+        approval_request = None
+        if approval_reference and approval_reference.startswith("AHR-"):
+            approval_request = validate_approval_reference(approval_reference, normalized)
+            if isinstance(approval_request, Response):
+                return approval_request
+
         results = []
         try:
             with request.env.cr.savepoint():
                 for operation in normalized:
                     results.append(execute_operation(operation))
+                if approval_request:
+                    approval_request.action_mark_consumed()
         except ExecutionPlanError as error:
             return json_error(error.code, error.message, error.status)
 
@@ -665,6 +755,7 @@ class AgenticHeadlessController(http.Controller):
             "audit": {
                 "request_log": "This execute_plan request and response are captured in agentic.request.log.",
                 "rollback_scope": "Operations run inside one database savepoint; execution errors roll back this plan batch.",
+                "approval_request": serialize_approval_request(approval_request) if approval_request else None,
             },
             "rollback_hints": rollback_hints(normalized, results),
         })
@@ -1421,6 +1512,114 @@ def parse_logged_json(value):
         return json.loads(value or "{}")
     except json.JSONDecodeError:
         return value
+
+
+def approval_queue_available():
+    return model_exists("agentic.approval.request") and table_exists("agentic_approval_request")
+
+
+def approval_request_plan_and_ops(payload):
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    operations = plan.get("operations") if isinstance(plan, dict) else None
+    if not operations:
+        operations = payload.get("operations")
+    if not isinstance(operations, list) or not operations:
+        return None, None, json_error("invalid_approval_plan", "Expected a non-empty plan.operations or operations list.", 400)
+    if len(operations) > 10:
+        return None, None, json_error("too_many_operations", "Approval requests accept at most 10 operations.", 400)
+
+    normalized, validation_error = normalize_execution_operations(operations)
+    if validation_error:
+        return None, None, validation_error
+
+    if not plan:
+        plan = {
+            "title": required_string(payload, "goal") or "Agentic action approval",
+            "operations": operations,
+        }
+    return plan, normalized, None
+
+
+def approval_request_domain(payload):
+    domain = []
+    status = required_string(payload, "status")
+    risk = required_string(payload, "risk")
+    approval_reference = required_string(payload, "approval_reference")
+    if status:
+        domain.append(("status", "=", status))
+    if risk:
+        domain.append(("risk", "=", risk))
+    if approval_reference:
+        domain.append(("approval_reference", "=", approval_reference))
+    since_days = payload.get("since_days")
+    if since_days is not None:
+        since = odoo_fields.Datetime.now() - timedelta(days=bounded_days(since_days))
+        domain.append(("create_date", ">=", odoo_fields.Datetime.to_string(since)))
+    return domain
+
+
+def serialize_approval_request(record, include_plan=False):
+    if not record:
+        return None
+    item = {
+        "id": record.id,
+        "approval_reference": record.approval_reference,
+        "status": record.status,
+        "risk": record.risk,
+        "goal": record.goal,
+        "requested_by": record.requested_by,
+        "created_at": record.create_date,
+        "approved_by": record.approved_by_id.display_name if record.approved_by_id else None,
+        "approved_at": record.approved_at,
+        "consumed_at": record.consumed_at,
+    }
+    if include_plan:
+        item.update({
+            "plan": parse_logged_json(record.plan_json),
+            "normalized_operations": parse_logged_json(record.normalized_operations_json),
+            "approval_note": record.approval_note,
+            "rejection_reason": record.rejection_reason,
+        })
+    return item
+
+
+def infer_operations_risk(operations):
+    if any(operation["operation"] == "write" and operation["model"] == "account.move" for operation in operations):
+        return "high"
+    if any(operation["operation"] in {"create", "write"} for operation in operations):
+        return "medium"
+    return "low"
+
+
+def validate_approval_reference(approval_reference, normalized_operations):
+    if not approval_queue_available():
+        return json_error("approval_queue_unavailable", "The approval queue is not installed; use an external approval reference.", 503)
+
+    record = request.env["agentic.approval.request"].sudo().search(
+        [("approval_reference", "=", approval_reference)],
+        limit=1,
+    )
+    if not record:
+        return json_error("approval_reference_unknown", f"Unknown approval reference: {approval_reference}", 404)
+    if record.status != "approved":
+        return json_error(
+            "approval_reference_not_approved",
+            f"Approval reference {approval_reference} is {record.status}, not approved.",
+            403,
+        )
+
+    approved_operations = parse_logged_json(record.normalized_operations_json)
+    if comparable_operations(approved_operations) != comparable_operations(normalized_operations):
+        return json_error(
+            "approval_reference_plan_mismatch",
+            "The approved operations do not match the execute_plan operations.",
+            403,
+        )
+    return record
+
+
+def comparable_operations(operations):
+    return json.dumps(operations, default=str, sort_keys=True)
 
 
 def domain_capability(model_name, domain_name, requested_fields):

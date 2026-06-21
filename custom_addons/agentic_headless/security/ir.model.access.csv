@@ -1,2 +1,3 @@
 id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
 access_agentic_request_log_system,agentic.request.log system,model_agentic_request_log,base.group_system,1,0,0,0
+access_agentic_approval_request_system,agentic.approval.request system,model_agentic_approval_request,base.group_system,1,1,1,0
