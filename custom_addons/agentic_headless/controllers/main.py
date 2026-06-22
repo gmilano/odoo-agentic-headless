@@ -45,6 +45,13 @@ ALLOWED_OPERATIONS = [
         "effect": "read_normalized_recent_changes",
     },
     {
+        "name": "business_cockpit",
+        "endpoint": "/agentic/v1/business_cockpit",
+        "method": "GET|POST",
+        "risk": "low",
+        "effect": "read_executive_business_metrics",
+    },
+    {
         "name": "action_plan",
         "endpoint": "/agentic/v1/action_plan",
         "method": "POST",
@@ -609,6 +616,40 @@ class AgenticHeadlessController(http.Controller):
         })
 
     @http.route(
+        "/agentic/v1/business_cockpit",
+        type="http",
+        auth="public",
+        methods=["GET", "POST"],
+        csrf=False,
+        cors="*",
+    )
+    def business_cockpit(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        payload = read_json()
+        limit = min(bounded_limit(payload.get("limit", 20)), 50)
+        currency = company_currency_name()
+        cockpit = {
+            "revenue": cockpit_revenue(limit, currency),
+            "pipeline": cockpit_pipeline(limit, currency),
+            "cash": cockpit_cash(limit, currency),
+            "inventory_risk": cockpit_inventory_risk(limit),
+            "delivery_risk": cockpit_delivery_risk(limit),
+            "approvals": cockpit_approvals(limit),
+        }
+        return json_response({
+            "ok": True,
+            "database": getattr(request.env.cr, "dbname", None),
+            "company": company_snapshot(),
+            "as_of": odoo_fields.Datetime.to_string(odoo_fields.Datetime.now()),
+            "limit": limit,
+            "cockpit": cockpit,
+            "insights": business_cockpit_insights(cockpit),
+        })
+
+    @http.route(
         "/agentic/v1/capabilities",
         type="http",
         auth="public",
@@ -656,7 +697,7 @@ class AgenticHeadlessController(http.Controller):
             },
             "next_safety_gaps": [
                 "Classify write/call payloads before execution.",
-                "Require approved queue references for all medium/high risk execute_plan writes.",
+                "Add role-based permission profiles for executive, ops, finance, and admin API use.",
                 "Promote execute_plan rollback payloads into approval requests for reviewed reversal workflows.",
             ],
         })
@@ -1113,6 +1154,266 @@ def model_snapshot(model_name, domain_name, requested_fields, sample_limit):
         "fields": fields,
         "sample": sample,
     }
+
+
+def company_currency_name():
+    if not model_exists("res.company"):
+        return None
+    company = request.env.company.sudo()
+    return company.currency_id.name if company.currency_id else None
+
+
+def cockpit_model_unavailable(model_name):
+    return {
+        "available": False,
+        "model": model_name,
+        "summary": "Model is not installed in this Odoo database.",
+    }
+
+
+def cockpit_model(model_name):
+    if not model_exists(model_name):
+        return None
+    return request.env[model_name].sudo().with_context(agentic_headless=True)
+
+
+def cockpit_fields(model):
+    return set(model._fields)
+
+
+def cockpit_domain(model, clauses):
+    fields = cockpit_fields(model)
+    return [clause for clause in clauses if not clause or clause[0] in fields]
+
+
+def cockpit_search_read(model, domain, fields, limit, order=None):
+    available = [field for field in fields if field in model._fields]
+    if "display_name" not in available:
+        available.append("display_name")
+    order = cockpit_order(model, order)
+    return model.search_read(
+        domain=domain,
+        fields=available,
+        limit=limit,
+        order=order,
+    )
+
+
+def cockpit_order(model, order):
+    if order:
+        first = str(order).split(",", 1)[0].strip().split(" ", 1)[0]
+        if first in model._fields:
+            return order
+    return default_order(model)
+
+
+def cockpit_sum(model, domain, field_name, limit=500):
+    if field_name not in model._fields:
+        return None
+    rows = model.search_read(domain=domain, fields=[field_name], limit=limit)
+    return sum(float(row.get(field_name) or 0) for row in rows)
+
+
+def cockpit_count(model, domain):
+    return model.search_count(domain)
+
+
+def cockpit_revenue(limit, currency):
+    model = cockpit_model("sale.order")
+    if model is None:
+        return cockpit_model_unavailable("sale.order")
+
+    confirmed_domain = cockpit_domain(model, [("state", "in", ["sale", "done"])])
+    quotation_domain = cockpit_domain(model, [("state", "in", ["draft", "sent"])])
+    fields = ["name", "partner_id", "state", "amount_total", "date_order", "invoice_status"]
+    return {
+        "available": True,
+        "model": "sale.order",
+        "currency": currency,
+        "confirmed_total": cockpit_sum(model, confirmed_domain, "amount_total"),
+        "confirmed_count": cockpit_count(model, confirmed_domain),
+        "quotation_total": cockpit_sum(model, quotation_domain, "amount_total"),
+        "quotation_count": cockpit_count(model, quotation_domain),
+        "top_confirmed_orders": cockpit_search_read(model, confirmed_domain, fields, limit, order="amount_total desc"),
+    }
+
+
+def cockpit_pipeline(limit, currency):
+    model = cockpit_model("crm.lead")
+    if model is None:
+        return cockpit_model_unavailable("crm.lead")
+
+    domain = cockpit_domain(model, [("active", "=", True)])
+    rows = cockpit_search_read(
+        model,
+        domain,
+        ["name", "partner_id", "stage_id", "expected_revenue", "probability", "priority", "date_deadline"],
+        limit,
+        order="expected_revenue desc",
+    )
+    total = sum(float(row.get("expected_revenue") or 0) for row in rows)
+    weighted = sum(
+        float(row.get("expected_revenue") or 0) * float(row.get("probability") or 0) / 100
+        for row in rows
+    )
+    return {
+        "available": True,
+        "model": "crm.lead",
+        "currency": currency,
+        "open_count": cockpit_count(model, domain),
+        "sample_total_expected_revenue": total,
+        "sample_weighted_expected_revenue": weighted,
+        "top_opportunities": rows,
+        "note": "Pipeline totals are based on the returned sample limit until a read_group aggregation is added.",
+    }
+
+
+def cockpit_cash(limit, currency):
+    model = cockpit_model("account.move")
+    if model is None:
+        return cockpit_model_unavailable("account.move")
+
+    receivable_domain = cockpit_domain(
+        model,
+        [
+            ("move_type", "=", "out_invoice"),
+            ("state", "=", "posted"),
+            ("payment_state", "in", ["not_paid", "partial"]),
+        ],
+    )
+    payable_domain = cockpit_domain(
+        model,
+        [
+            ("move_type", "=", "in_invoice"),
+            ("state", "=", "posted"),
+            ("payment_state", "in", ["not_paid", "partial"]),
+        ],
+    )
+    amount_field = "amount_residual" if "amount_residual" in model._fields else "amount_total"
+    fields = ["name", "partner_id", "move_type", "state", "payment_state", amount_field, "invoice_date_due"]
+    return {
+        "available": True,
+        "model": "account.move",
+        "currency": currency,
+        "open_receivables_total": cockpit_sum(model, receivable_domain, amount_field),
+        "open_receivables_count": cockpit_count(model, receivable_domain),
+        "open_payables_total": cockpit_sum(model, payable_domain, amount_field),
+        "open_payables_count": cockpit_count(model, payable_domain),
+        "largest_open_receivables": cockpit_search_read(model, receivable_domain, fields, limit, order=f"{amount_field} desc"),
+        "largest_open_payables": cockpit_search_read(model, payable_domain, fields, limit, order=f"{amount_field} desc"),
+    }
+
+
+def cockpit_inventory_risk(limit):
+    model = cockpit_model("stock.quant")
+    if model is None:
+        return cockpit_model_unavailable("stock.quant")
+
+    negative_domain = cockpit_domain(model, [("quantity", "<", 0)])
+    reserved_domain = cockpit_domain(model, [("reserved_quantity", ">", 0)])
+    fields = ["product_id", "location_id", "quantity", "reserved_quantity", "available_quantity"]
+    return {
+        "available": True,
+        "model": "stock.quant",
+        "negative_stock_count": cockpit_count(model, negative_domain),
+        "reserved_stock_count": cockpit_count(model, reserved_domain),
+        "negative_stock": cockpit_search_read(model, negative_domain, fields, limit, order="quantity asc"),
+        "reserved_stock": cockpit_search_read(model, reserved_domain, fields, limit, order="reserved_quantity desc"),
+    }
+
+
+def cockpit_delivery_risk(limit):
+    model = cockpit_model("stock.picking")
+    if model is None:
+        return cockpit_model_unavailable("stock.picking")
+
+    now = odoo_fields.Datetime.now()
+    domain = cockpit_domain(
+        model,
+        [
+            ("state", "not in", ["done", "cancel"]),
+            ("scheduled_date", "<", now),
+            ("picking_type_code", "=", "outgoing"),
+        ],
+    )
+    fields = ["name", "partner_id", "state", "scheduled_date", "picking_type_id", "origin"]
+    return {
+        "available": True,
+        "model": "stock.picking",
+        "overdue_outgoing_count": cockpit_count(model, domain),
+        "overdue_outgoing": cockpit_search_read(model, domain, fields, limit, order="scheduled_date asc"),
+    }
+
+
+def cockpit_approvals(limit):
+    model = cockpit_model("agentic.approval.request")
+    if model is None:
+        return cockpit_model_unavailable("agentic.approval.request")
+
+    pending_domain = [("status", "=", "pending")]
+    high_domain = [("status", "=", "pending"), ("risk", "=", "high")]
+    fields = ["approval_reference", "status", "risk", "goal", "requested_by", "create_date"]
+    return {
+        "available": True,
+        "model": "agentic.approval.request",
+        "pending_count": cockpit_count(model, pending_domain),
+        "pending_high_risk_count": cockpit_count(model, high_domain),
+        "pending": cockpit_search_read(model, pending_domain, fields, limit, order="create_date desc"),
+    }
+
+
+def business_cockpit_insights(cockpit):
+    insights = []
+    revenue = cockpit.get("revenue") or {}
+    pipeline = cockpit.get("pipeline") or {}
+    cash = cockpit.get("cash") or {}
+    inventory = cockpit.get("inventory_risk") or {}
+    delivery = cockpit.get("delivery_risk") or {}
+    approvals = cockpit.get("approvals") or {}
+
+    if revenue.get("available") and not revenue.get("confirmed_count"):
+        insights.append({
+            "level": "commercial",
+            "title": "No confirmed revenue found",
+            "detail": "The cockpit sees quotations or CRM context, but no confirmed sale orders yet.",
+        })
+    if pipeline.get("available") and pipeline.get("open_count"):
+        insights.append({
+            "level": "pipeline",
+            "title": "Open opportunities are ready for agent review",
+            "detail": f"{pipeline.get('open_count')} CRM opportunities can be prioritized by expected and weighted revenue.",
+        })
+    if cash.get("available") and (cash.get("open_receivables_count") or cash.get("open_payables_count")):
+        insights.append({
+            "level": "cash",
+            "title": "Cash exposure is visible",
+            "detail": f"Open receivables: {cash.get('open_receivables_count')}; open payables: {cash.get('open_payables_count')}.",
+        })
+    if inventory.get("available") and inventory.get("negative_stock_count"):
+        insights.append({
+            "level": "inventory",
+            "title": "Negative stock needs operational review",
+            "detail": f"{inventory.get('negative_stock_count')} stock quants are below zero.",
+        })
+    if delivery.get("available") and delivery.get("overdue_outgoing_count"):
+        insights.append({
+            "level": "delivery",
+            "title": "Overdue outgoing deliveries detected",
+            "detail": f"{delivery.get('overdue_outgoing_count')} outgoing pickings are scheduled in the past and not done.",
+        })
+    if approvals.get("available") and approvals.get("pending_count"):
+        insights.append({
+            "level": "approval",
+            "title": "Agent actions are waiting for human review",
+            "detail": f"{approvals.get('pending_count')} pending approval requests, {approvals.get('pending_high_risk_count')} high risk.",
+        })
+    if not insights:
+        insights.append({
+            "level": "ready",
+            "title": "Executive cockpit is available",
+            "detail": "No immediate revenue, cash, inventory, delivery, or approval risks were detected from the tracked models.",
+        })
+    return insights
 
 
 def normalized_model_events(model_name, domain_name, requested_fields, since, limit):
