@@ -69,6 +69,14 @@ ALLOWED_OPERATIONS = [
         "requires_approval": True,
     },
     {
+        "name": "risk_classification",
+        "endpoint": "/agentic/v1/risk_classification",
+        "method": "POST",
+        "risk": "low",
+        "effect": "classify_destructive_or_financial_operations_without_execution",
+        "executes": False,
+    },
+    {
         "name": "approval_requests",
         "endpoint": "/agentic/v1/approval_requests",
         "method": "GET|POST",
@@ -128,7 +136,7 @@ RISKY_OPERATIONS = [
     {
         "name": "write_financial_records",
         "reason": "Financial records can affect invoices, journals, tax reports, and external accounting state.",
-        "current_guardrail": "execute_plan blocks account.move writes until financial risk classification can require an approved queue reference.",
+        "current_guardrail": "risk_classification flags account.move create/write as high risk and execute_plan blocks account.move writes outright.",
     },
     {
         "name": "confirm_or_cancel_documents",
@@ -136,6 +144,48 @@ RISKY_OPERATIONS = [
         "current_guardrail": "Treat state transitions as approval-required and create an approval request before an adapter executes them.",
     },
 ]
+
+# Risk classification policy (AH-0105). Centralizes how destructive or
+# financial operations are scored before any execution path runs.
+FINANCIAL_MODELS = {
+    "account.move",
+    "account.move.line",
+    "account.payment",
+    "account.payment.register",
+    "account.bank.statement",
+    "account.bank.statement.line",
+    "account.journal",
+    "account.account",
+    "account.tax",
+    "account.reconcile.model",
+    "account.full.reconcile",
+    "account.partial.reconcile",
+}
+DESTRUCTIVE_OPERATIONS = {"unlink", "delete", "remove"}
+ARBITRARY_OPERATIONS = {"call"}
+WRITE_OPERATIONS = {"create", "write", "update"}
+READ_ONLY_OPERATIONS = {
+    "search_read",
+    "read",
+    "search",
+    "search_count",
+    "name_search",
+    "schema",
+    "fields_get",
+}
+STATE_SENSITIVE_FIELDS = {
+    "state",
+    "active",
+    "payment_state",
+    "move_type",
+    "amount_total",
+    "amount_residual",
+    "reconciled",
+    "posted",
+    "company_id",
+    "currency_id",
+}
+RISK_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 ERP_MODEL_CATALOG = [
     ("res.partner", "contacts", ["name", "email", "phone", "is_company"]),
@@ -694,12 +744,60 @@ class AgenticHeadlessController(http.Controller):
                 "audit_log_retention_days": AUDIT_LOG_RETENTION_DAYS,
                 "approved_plan_execution": True,
                 "approval_queue": approval_queue_available(),
+                "risk_classifier": True,
             },
             "next_safety_gaps": [
-                "Classify write/call payloads before execution.",
                 "Add role-based permission profiles for executive, ops, finance, and admin API use.",
                 "Promote execute_plan rollback payloads into approval requests for reviewed reversal workflows.",
+                "Wire risk_classification into action_plan output so plans ship with per-operation risk factors.",
             ],
+        })
+
+    @http.route(
+        "/agentic/v1/risk_classification",
+        type="http",
+        auth="public",
+        methods=["POST"],
+        csrf=False,
+        cors="*",
+    )
+    def risk_classification(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        payload = read_json()
+        plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+        operations = plan.get("operations") if isinstance(plan, dict) else None
+        if not operations:
+            operations = payload.get("operations")
+        if isinstance(payload.get("operation"), str):
+            operations = [payload]
+        if not isinstance(operations, list) or not operations:
+            return json_error(
+                "invalid_classification_request",
+                "Expected a non-empty operations list, plan.operations, or a single operation object.",
+                400,
+            )
+        if len(operations) > 50:
+            return json_error("too_many_operations", "risk_classification accepts at most 50 operations.", 400)
+
+        classification = classify_operations_risk(operations)
+        return json_response({
+            "ok": True,
+            "executes": False,
+            "classification": classification,
+            "policy": {
+                "financial_models": sorted(FINANCIAL_MODELS),
+                "destructive_operations": sorted(DESTRUCTIVE_OPERATIONS),
+                "state_sensitive_fields": sorted(STATE_SENSITIVE_FIELDS),
+                "approval_required_levels": ["medium", "high"],
+            },
+            "next_step": (
+                "Create an approval request via /agentic/v1/approval_requests for medium/high risk before execute_plan."
+                if classification["requires_approval"]
+                else "Low risk: execute_plan may run this without a durable approval reference."
+            ),
         })
 
     @http.route(
@@ -2293,11 +2391,120 @@ def serialize_approval_request(record, include_plan=False):
 
 
 def infer_operations_risk(operations):
-    if any(operation["operation"] == "write" and operation["model"] == "account.move" for operation in operations):
-        return "high"
-    if any(operation["operation"] in {"create", "write"} for operation in operations):
-        return "medium"
-    return "low"
+    return classify_operations_risk(operations)["risk"]
+
+
+def classify_operations_risk(operations):
+    """Classify a list of proposed operations for destructive/financial risk.
+
+    Works on both normalized execute operations and raw action-plan operation
+    templates. Does not execute anything; it only scores intent so callers can
+    require approval, block, or surface the risk to a human or agent.
+    """
+    factors = [classify_one_operation(operation, index) for index, operation in enumerate(operations or [])]
+    overall = "low"
+    for factor in factors:
+        overall = higher_risk(overall, factor["risk"])
+    financial = any(factor["financial"] for factor in factors)
+    destructive = any(factor["destructive"] for factor in factors)
+    requires_approval = overall in {"medium", "high"}
+    return {
+        "risk": overall,
+        "financial": financial,
+        "destructive": destructive,
+        "requires_approval": requires_approval,
+        "requires_durable_approval_reference": requires_approval,
+        "operation_count": len(factors),
+        "factors": factors,
+        "summary": risk_classification_summary(overall, financial, destructive, len(factors)),
+    }
+
+
+def classify_one_operation(operation, index):
+    if not isinstance(operation, dict):
+        return {
+            "index": index,
+            "operation": None,
+            "model": None,
+            "risk": "high",
+            "financial": False,
+            "destructive": False,
+            "reasons": ["Operation is not a structured object and cannot be safely classified."],
+        }
+
+    name = (required_string(operation, "operation") or "").lower()
+    payload = operation_payload(operation) or {}
+    model = (required_string(operation, "model") or required_string(payload, "model") or "").strip()
+    values = operation_values(operation, payload)
+    financial = bool(model) and model in FINANCIAL_MODELS
+    destructive = name in DESTRUCTIVE_OPERATIONS
+    reasons = []
+    risk = "low"
+
+    if destructive:
+        risk = "high"
+        reasons.append(f"Destructive '{name}' permanently removes records.")
+    elif name in ARBITRARY_OPERATIONS:
+        risk = "high"
+        reasons.append("Arbitrary model method call can trigger workflows outside typed guardrails.")
+    elif name in WRITE_OPERATIONS:
+        risk = "medium"
+        reasons.append(f"'{name}' changes persisted business records.")
+        if financial:
+            risk = "high"
+            reasons.append(f"Targets financial model '{model}' affecting accounting state.")
+        sensitive = sorted(STATE_SENSITIVE_FIELDS & set(values.keys()))
+        if sensitive:
+            risk = "high"
+            reasons.append(f"Modifies state-sensitive field(s): {', '.join(sensitive)}.")
+    elif name in READ_ONLY_OPERATIONS or not name:
+        reasons.append("Read-only or metadata operation with no state change.")
+    else:
+        risk = "medium"
+        reasons.append(f"Unrecognized operation '{name}' treated as medium risk by default.")
+
+    if financial and risk != "high":
+        reasons.append(f"Operates on financial model '{model}'.")
+
+    return {
+        "index": operation.get("index", index),
+        "operation": name or None,
+        "model": model or None,
+        "risk": risk,
+        "financial": financial,
+        "destructive": destructive,
+        "reasons": reasons,
+    }
+
+
+def operation_values(operation, payload):
+    for source in (payload, operation):
+        if not isinstance(source, dict):
+            continue
+        for key in ("values", "vals", "data"):
+            candidate = source.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+    return {}
+
+
+def higher_risk(current, candidate):
+    if RISK_LEVEL_ORDER.get(candidate, 0) > RISK_LEVEL_ORDER.get(current, 0):
+        return candidate
+    return current
+
+
+def risk_classification_summary(overall, financial, destructive, count):
+    if count == 0:
+        return "No operations supplied; nothing to classify."
+    tags = []
+    if destructive:
+        tags.append("destructive")
+    if financial:
+        tags.append("financial")
+    detail = f" ({', '.join(tags)})" if tags else ""
+    plural = "operation" if count == 1 else "operations"
+    return f"{count} {plural} classified as {overall} risk{detail}."
 
 
 def requires_durable_approval_reference(operations):
