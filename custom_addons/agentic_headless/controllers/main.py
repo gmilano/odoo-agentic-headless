@@ -172,6 +172,12 @@ READ_ONLY_OPERATIONS = {
     "name_search",
     "schema",
     "fields_get",
+    # Comprehension endpoints surface aggregated business context without
+    # mutating any record, so action plans built from them stay low risk.
+    "business_snapshot",
+    "business_events",
+    "business_cockpit",
+    "capabilities",
 }
 STATE_SENSITIVE_FIELDS = {
     "state",
@@ -749,7 +755,6 @@ class AgenticHeadlessController(http.Controller):
             "next_safety_gaps": [
                 "Add role-based permission profiles for executive, ops, finance, and admin API use.",
                 "Promote execute_plan rollback payloads into approval requests for reviewed reversal workflows.",
-                "Wire risk_classification into action_plan output so plans ship with per-operation risk factors.",
             ],
         })
 
@@ -928,7 +933,8 @@ class AgenticHeadlessController(http.Controller):
 
         template = select_action_plan_template(goal)
         unavailable_models = unavailable_required_models(template)
-        risk = template.get("risk") or inferred_plan_risk(template)
+        classification = classify_operations_risk(template.get("operations") or [])
+        risk = template.get("risk") or classification["risk"]
         approval_required = bool(template.get("approval_required") or risk in {"medium", "high"})
         missing_inputs = list(template.get("required_inputs") or [])
         candidate_values = payload.get("candidate_values") if isinstance(payload.get("candidate_values"), dict) else {}
@@ -949,6 +955,15 @@ class AgenticHeadlessController(http.Controller):
                 "candidate_values": candidate_values,
                 "unavailable_models": unavailable_models,
                 "operations": template["operations"],
+                "risk_classification": {
+                    "risk": classification["risk"],
+                    "financial": classification["financial"],
+                    "destructive": classification["destructive"],
+                    "requires_approval": classification["requires_approval"],
+                    "requires_durable_approval_reference": classification["requires_durable_approval_reference"],
+                    "summary": classification["summary"],
+                },
+                "risk_factors": classification["factors"],
                 "execution_contract": {
                     "execute_endpoint": "/agentic/v1/execute_plan",
                     "available": True,
