@@ -1,0 +1,20 @@
+name = "odoo-agentic-mcp"
+main = "worker.js"
+compatibility_date = "2024-11-05"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+DEFAULT_PROFILE = "admin"
+
+# Secrets — set via: wrangler secret put ODOO_BASE_URL
+# ODOO_BASE_URL
+# ODOO_AGENTIC_API_KEY
+# MCP_AUTH_TOKEN          (optional, leave unset to allow open access)
+
+[[routes]]
+pattern = "odoo-mcp.wany.workers.dev/*"
+zone_name = "wany.workers.dev"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
