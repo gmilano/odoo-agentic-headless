@@ -102,6 +102,14 @@ ALLOWED_OPERATIONS = [
         "executes": False,
     },
     {
+        "name": "permission_profiles",
+        "endpoint": "/agentic/v1/permission_profiles",
+        "method": "GET|POST",
+        "risk": "low",
+        "effect": "describe_role_based_permission_profiles_and_active_profile",
+        "executes": False,
+    },
+    {
         "name": "create",
         "endpoint": "/agentic/v1/create",
         "method": "POST",
@@ -192,6 +200,54 @@ STATE_SENSITIVE_FIELDS = {
     "currency_id",
 }
 RISK_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+# Permission profiles (AH-0104). Defense in depth on top of the bearer token:
+# even a valid API key is scoped to one role so an agent can only run the
+# operations its role permits. The active profile is selected per request via
+# the `X-Agentic-Profile` header, or globally via AGENTIC_HEADLESS_PROFILE.
+# When neither is set the API stays fully open as `admin` for backward compat.
+READ_PLAN_OPERATION_NAMES = {
+    "health",
+    "schema",
+    "search_read",
+    "business_snapshot",
+    "business_events",
+    "business_cockpit",
+    "capabilities",
+    "action_plan",
+    "risk_classification",
+    "okf_bundle",
+    "audit_logs",
+    "approval_requests",
+    "permission_profiles",
+}
+PERMISSION_PROFILES = {
+    "executive": {
+        "label": "Executive (read-only)",
+        "description": "Business comprehension, planning, audit review, and approval requests. Cannot write, call methods, or execute plans.",
+        "operations": set(READ_PLAN_OPERATION_NAMES),
+        "allow_financial": False,
+    },
+    "ops": {
+        "label": "Operations operator",
+        "description": "Everything an executive can do plus create/write/execute_plan on non-financial models. Cannot touch accounting models or invoke arbitrary methods.",
+        "operations": READ_PLAN_OPERATION_NAMES | {"create", "write", "execute_plan"},
+        "allow_financial": False,
+    },
+    "finance": {
+        "label": "Finance operator",
+        "description": "Everything an ops operator can do plus create/write/execute_plan on financial/accounting models. Cannot invoke arbitrary methods.",
+        "operations": READ_PLAN_OPERATION_NAMES | {"create", "write", "execute_plan"},
+        "allow_financial": True,
+    },
+    "admin": {
+        "label": "Administrator",
+        "description": "Unrestricted access to every agentic operation including arbitrary model method calls.",
+        "operations": "*",
+        "allow_financial": True,
+    },
+}
+DEFAULT_PROFILE = "admin"
 
 ERP_MODEL_CATALOG = [
     ("res.partner", "contacts", ["name", "email", "phone", "is_company"]),
@@ -751,11 +807,54 @@ class AgenticHeadlessController(http.Controller):
                 "approved_plan_execution": True,
                 "approval_queue": approval_queue_available(),
                 "risk_classifier": True,
+                "permission_profiles": True,
+            },
+            "permission_profiles": {
+                "active_profile": active_profile_name(),
+                "default_profile": DEFAULT_PROFILE,
+                "available": sorted(PERMISSION_PROFILES),
+                "selection_header": "X-Agentic-Profile",
+                "endpoint": "/agentic/v1/permission_profiles",
             },
             "next_safety_gaps": [
-                "Add role-based permission profiles for executive, ops, finance, and admin API use.",
                 "Promote execute_plan rollback payloads into approval requests for reviewed reversal workflows.",
+                "Bind permission profiles to distinct API keys instead of a request header so callers cannot self-escalate.",
             ],
+        })
+
+    @http.route(
+        "/agentic/v1/permission_profiles",
+        type="http",
+        auth="public",
+        methods=["GET", "POST"],
+        csrf=False,
+        cors="*",
+    )
+    def permission_profiles(self, **_kwargs):
+        auth_error = require_api_key()
+        if auth_error:
+            return auth_error
+
+        name, profile, error = resolve_active_profile()
+        if error:
+            return error
+
+        return json_response({
+            "ok": True,
+            "active_profile": {
+                "name": name,
+                "label": profile["label"],
+                "description": profile["description"],
+                "allowed_operations": "*" if profile["operations"] == "*" else sorted(profile["operations"]),
+                "allow_financial": profile["allow_financial"],
+            },
+            "default_profile": DEFAULT_PROFILE,
+            "selection": {
+                "header": "X-Agentic-Profile",
+                "env": "AGENTIC_HEADLESS_PROFILE",
+                "precedence": "request header overrides env var; unset falls back to the default profile.",
+            },
+            "profiles": profile_directory(),
         })
 
     @http.route(
@@ -1008,6 +1107,11 @@ class AgenticHeadlessController(http.Controller):
         if validation_error:
             return validation_error
 
+        classification = classify_operations_risk(normalized)
+        profile_error = enforce_profile("execute_plan", financial=classification["financial"])
+        if profile_error:
+            return profile_error
+
         if requires_durable_approval_reference(normalized) and not is_durable_approval_reference(approval_reference):
             return json_error(
                 "durable_approval_required",
@@ -1088,7 +1192,11 @@ class AgenticHeadlessController(http.Controller):
             return auth_error
 
         payload = read_json()
-        model = get_model(required_string(payload, "model"))
+        model_name = required_string(payload, "model")
+        profile_error = enforce_profile("create", financial=model_name in FINANCIAL_MODELS)
+        if profile_error:
+            return profile_error
+        model = get_model(model_name)
         if isinstance(model, Response):
             return model
 
@@ -1117,7 +1225,11 @@ class AgenticHeadlessController(http.Controller):
             return auth_error
 
         payload = read_json()
-        model = get_model(required_string(payload, "model"))
+        model_name = required_string(payload, "model")
+        profile_error = enforce_profile("write", financial=model_name in FINANCIAL_MODELS)
+        if profile_error:
+            return profile_error
+        model = get_model(model_name)
         if isinstance(model, Response):
             return model
 
@@ -1148,6 +1260,10 @@ class AgenticHeadlessController(http.Controller):
         auth_error = require_api_key()
         if auth_error:
             return auth_error
+
+        profile_error = enforce_profile("call")
+        if profile_error:
+            return profile_error
 
         payload = read_json()
         model = get_model(required_string(payload, "model"))
@@ -1186,6 +1302,76 @@ def require_api_key():
     if token != expected:
         return json_error("unauthorized", "Invalid or missing bearer token.", 401)
     return None
+
+
+def resolve_active_profile():
+    """Resolve the permission profile for this request.
+
+    Returns ``(name, profile_dict, error_response)``. ``error_response`` is a
+    JSON 403 when an unknown profile is requested; otherwise it is ``None``.
+    """
+    name = (
+        request.httprequest.headers.get("X-Agentic-Profile")
+        or os.getenv("AGENTIC_HEADLESS_PROFILE")
+        or DEFAULT_PROFILE
+    ).strip().lower()
+    profile = PERMISSION_PROFILES.get(name)
+    if not profile:
+        known = ", ".join(sorted(PERMISSION_PROFILES))
+        return name, None, json_error(
+            "unknown_profile",
+            f"Unknown permission profile '{name}'. Known profiles: {known}.",
+            403,
+        )
+    return name, profile, None
+
+
+def enforce_profile(operation_name, financial=False):
+    """Authorize an operation against the active permission profile.
+
+    Returns a JSON 403 ``Response`` when the active profile may not run the
+    operation (or touch financial models), otherwise ``None``.
+    """
+    name, profile, error = resolve_active_profile()
+    if error:
+        return error
+    operations = profile["operations"]
+    if operations != "*" and operation_name not in operations:
+        return json_error(
+            "operation_not_permitted_for_profile",
+            f"Permission profile '{name}' ({profile['label']}) may not use operation '{operation_name}'.",
+            403,
+        )
+    if financial and not profile["allow_financial"]:
+        return json_error(
+            "financial_not_permitted_for_profile",
+            f"Permission profile '{name}' ({profile['label']}) may not operate on financial/accounting models.",
+            403,
+        )
+    return None
+
+
+def profile_directory():
+    """Serialize all permission profiles for discovery responses."""
+    directory = []
+    for name, profile in PERMISSION_PROFILES.items():
+        operations = profile["operations"]
+        directory.append({
+            "name": name,
+            "label": profile["label"],
+            "description": profile["description"],
+            "allowed_operations": "*" if operations == "*" else sorted(operations),
+            "allow_financial": profile["allow_financial"],
+        })
+    return directory
+
+
+def active_profile_name():
+    return (
+        request.httprequest.headers.get("X-Agentic-Profile")
+        or os.getenv("AGENTIC_HEADLESS_PROFILE")
+        or DEFAULT_PROFILE
+    ).strip().lower()
 
 
 def read_json():
